@@ -1,21 +1,16 @@
 # age_gate.py
 # -----------
 # Detects age-restricted YouTube videos and manages cookie authentication.
-#
-# How it works:
-#   1. Detects age-restriction signals in yt-dlp output
-#   2. Checks if session_cookies.txt is present and valid
-#   3. If not, returns clear setup instructions for the UI to display
-#   4. Once cookies exist, all age-restricted downloads work automatically
-#
-# Usage:
-#   from age_gate import check_and_handle, get_cookie_args, cookie_file_valid
+# Dynamic browser detection — uses whatever browser the user has installed.
 
 import sys
+import winreg
 from datetime import datetime
 from pathlib import Path
 
-COOKIE_FILE = Path(__file__).resolve().parent / "session_cookies.txt"
+# Cookie file lives in user's Downloads so it's easy to find and
+# stays valid after the app moves from development to final location
+COOKIE_FILE = Path.home() / "Downloads" / "dynamic_cookies.txt"
 
 _AGE_SIGNALS = (
     "sign in to confirm your age",
@@ -28,11 +23,7 @@ _AGE_SIGNALS = (
     "login_required",
 )
 
-_COOKIE_EXTENSIONS = {
-    "firefox": {
-        "name": "cookies.txt",
-        "store": "https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/",
-    },
+_BROWSER_EXTENSIONS = {
     "chrome": {
         "name": "Get cookies.txt LOCALLY",
         "store": "https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
@@ -41,6 +32,26 @@ _COOKIE_EXTENSIONS = {
         "name": "Get cookies.txt LOCALLY",
         "store": "https://microsoftedge.microsoft.com/addons/detail/get-cookiestxt-locally/helipeccjnbmbhmenmfgjlknfkjihiaf",
     },
+    "firefox": {
+        "name": "cookies.txt",
+        "store": "https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/",
+    },
+    "brave": {
+        "name": "Get cookies.txt LOCALLY",
+        "store": "https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
+    },
+    "opera": {
+        "name": "Get cookies.txt LOCALLY",
+        "store": "https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
+    },
+}
+
+_BROWSER_PATHS = {
+    "chrome":   Path.home() / "AppData/Local/Google/Chrome",
+    "edge":     Path.home() / "AppData/Local/Microsoft/Edge",
+    "firefox":  Path.home() / "AppData/Roaming/Mozilla/Firefox",
+    "brave":    Path.home() / "AppData/Local/BraveSoftware/Brave-Browser",
+    "opera":    Path.home() / "AppData/Roaming/Opera Software",
 }
 
 
@@ -70,40 +81,69 @@ def cookie_file_valid() -> bool:
     return False
 
 
-def cookie_file_age_days() -> int | None:
+def cookie_file_age_days():
     if not COOKIE_FILE.exists():
         return None
-    mtime = datetime.fromtimestamp(COOKIE_FILE.stat().st_mtime)
-    return (datetime.now() - mtime).days
+    return (datetime.now() - datetime.fromtimestamp(COOKIE_FILE.stat().st_mtime)).days
 
 
-def _detect_available_browser() -> str:
+def _detect_default_browser() -> str:
+    """Try to detect the user's default browser from Windows registry.
+    Falls back to checking installed browser paths."""
     if sys.platform == "win32":
-        checks = [
-            ("firefox", Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox"),
-            ("chrome",  Path.home() / "AppData" / "Local"   / "Google"  / "Chrome"),
-            ("edge",    Path.home() / "AppData" / "Local"   / "Microsoft" / "Edge"),
-        ]
-        for browser, path in checks:
-            if path.exists():
-                return browser
-    return "edge"
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
+            )
+            prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+            winreg.CloseKey(key)
+            prog_id = prog_id.lower()
+            if "chrome" in prog_id:
+                return "chrome"
+            if "edge" in prog_id or "msedge" in prog_id:
+                return "edge"
+            if "firefox" in prog_id:
+                return "firefox"
+            if "brave" in prog_id:
+                return "brave"
+            if "opera" in prog_id:
+                return "opera"
+        except Exception:
+            pass
+
+    # Fallback: check which browsers are installed, prefer Chrome
+    for browser in ("chrome", "edge", "firefox", "brave", "opera"):
+        if _BROWSER_PATHS[browser].exists():
+            return browser
+
+    return "chrome"  # last resort — tell them to install Chrome
 
 
-def get_setup_instructions(browser: str = "edge") -> dict:
-    ext = _COOKIE_EXTENSIONS.get(browser, _COOKIE_EXTENSIONS["edge"])
+def get_cookie_args() -> list:
+    if COOKIE_FILE.exists():
+        return ["--cookies", str(COOKIE_FILE)]
+    return []
+
+
+def get_setup_instructions(browser: str = None) -> dict:
+    if browser is None:
+        browser = _detect_default_browser()
+    ext = _BROWSER_EXTENSIONS.get(browser, _BROWSER_EXTENSIONS["chrome"])
     cookie_path = str(COOKIE_FILE)
+
     steps = [
         f"Open {browser.title()} and make sure you're logged into YouTube.",
         f'Install the "{ext["name"]}" extension:\n{ext["store"]}',
-        "Go to https://www.youtube.com (the homepage, not a video).",
+        "Go to https://www.youtube.com (the homepage, not a specific video).",
         'Click the extension icon and choose "Export" or "Download cookies.txt".',
-        f"Save the file here:\n{cookie_path}",
+        f"Save the file here (exact name matters):\n{cookie_path}",
         "Come back and try the download again — it will work automatically.",
     ]
+
     return {
-        "title": "One-time setup for age-restricted videos",
-        "subtitle": "Only needs to be done once. Cookies stay valid for weeks.",
+        "title": "Age-Restricted Video",
+        "subtitle": "One-time setup needed. Cookies stay valid for weeks.",
         "steps": steps,
         "cookie_path": cookie_path,
         "extension_url": ext["store"],
@@ -112,11 +152,6 @@ def get_setup_instructions(browser: str = "edge") -> dict:
 
 
 def check_and_handle(stdout: str, stderr: str) -> dict:
-    """
-    Call when a yt-dlp run fails. Returns:
-      {"type": "age_restricted", "has_cookies": bool, "instructions": dict | None, "message": str}
-      {"type": "other_error"}
-    """
     if not is_age_restricted(stdout, stderr):
         return {"type": "other_error"}
 
@@ -132,13 +167,12 @@ def check_and_handle(stdout: str, stderr: str) -> dict:
             "days_old": days_old,
             "instructions": None,
             "message": (
-                f"Cookies may be expired ({days_old}d old). Re-export session_cookies.txt."
-                if expired else
-                "Age-restricted. Retrying with cookies..."
+                f"Cookies may be expired ({days_old}d old). Re-export {COOKIE_FILE.name}."
+                if expired else "Age-restricted. Retrying with cookies..."
             ),
         }
 
-    browser = _detect_available_browser()
+    browser = _detect_default_browser()
     return {
         "type": "age_restricted",
         "has_cookies": False,
@@ -147,10 +181,3 @@ def check_and_handle(stdout: str, stderr: str) -> dict:
         "instructions": get_setup_instructions(browser),
         "message": "This video is age-restricted. One-time setup required.",
     }
-
-
-def get_cookie_args() -> list[str]:
-    """Return --cookies flag if session_cookies.txt exists."""
-    if COOKIE_FILE.exists():
-        return ["--cookies", str(COOKIE_FILE)]
-    return []

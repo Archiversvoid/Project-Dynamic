@@ -68,7 +68,7 @@ INPUT_BG = "#333333"
 TEXT_MAIN = "#FFFFFF"
 TEXT_MUTED = "#8A8A8A"
 
-USE_FETCHER = False  # Set to True if fetch_formats is available
+USE_FETCHER = True   # fetcher.py + bot_guard.py + age_gate.py must be in the same folder
 
 
 def _find_js_engine():
@@ -105,34 +105,41 @@ def _get_cookies_args():
     return {}
 
 
+def _is_youtube_url(url: str) -> bool:
+    _yt = ("youtube.com", "youtu.be", "youtube-nocookie.com",
+           "music.youtube.com", "m.youtube.com")
+    return any(d in url.lower() for d in _yt)
+
+
 def fetch_formats(url):
-    """Fetch video formats using a local fetcher module or return a safe error."""
+    """Route to fetcher.py (YouTube) or universal_scraper.py (everything else)."""
     try:
         import importlib
-
-        module = importlib.import_module("fetcher")
-        if hasattr(module, "fetch_formats"):
-            return module.fetch_formats(url)
-        return {"ok": False, "error": "fetcher module does not define fetch_formats()"}
+        module_name = "fetcher" if _is_youtube_url(url) else "universal_scraper"
+        module = importlib.import_module(module_name)
+        for fn_name in ("fetch_formats", "scrape_formats"):
+            if hasattr(module, fn_name):
+                return getattr(module, fn_name)(url)
+        return {"ok": False, "error": f"{module_name} has no fetch/scrape function"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 def fetcher_download(url, selected_fid=None, out_dir=None, is_audio=False):
-    """Backward-compatible bridge for fetcher download helpers."""
+    """Route download to fetcher.py (YouTube) or universal_scraper.py (everything else)."""
     try:
         import importlib
-
-        module = importlib.import_module("fetcher")
+        module_name = "fetcher" if _is_youtube_url(url) else "universal_scraper"
+        module = importlib.import_module(module_name)
         candidates = [
             getattr(module, "fetcher_download", None),
-            getattr(module, "download", None),
+            getattr(module, "scrape_download", None),
             getattr(module, "download_video", None),
+            getattr(module, "download", None),
         ]
         fn = next((c for c in candidates if callable(c)), None)
         if fn is None:
-            raise AttributeError("fetcher module does not define a download function")
-
+            raise AttributeError(f"{module_name} has no download function")
         result = fn(url, selected_fid=selected_fid, out_dir=out_dir, is_audio=is_audio)
         if result is None:
             return []
@@ -362,8 +369,11 @@ class DyanmicPC(ctk.CTk):
                     return
                 if not result["ok"]:
                     age_info = result.get("age_gate")
-                    if age_info and not age_info.get("has_cookies"):
-                        self.after(0, lambda ai=age_info: (processing_bar.stop(), self._show_age_gate_panel(ai)))
+                    if (age_info
+                            and age_info.get("type") == "age_restricted"
+                            and not age_info.get("has_cookies")
+                            and age_info.get("instructions")):
+                        self.after(0, lambda ai=age_info["instructions"]: (processing_bar.stop(), self._show_age_gate_panel(ai)))
                     else:
                         self.after(0, lambda e=result["error"]: (processing_bar.stop(), self._show_inline_error(e)))
                     return
@@ -374,6 +384,7 @@ class DyanmicPC(ctk.CTk):
                     "thumbnail": result["thumbnail"],
                     "_video_formats": result["video_formats"],
                     "_audio_formats": result["audio_formats"],
+                    "_audio_only": result.get("audio_only", False),
                 }
             else:
                 info = None
@@ -409,8 +420,18 @@ class DyanmicPC(ctk.CTk):
                     )
                     with urllib.request.urlopen(req) as resp:
                         data = resp.read()
-                        img_obj = Image.open(BytesIO(data))
-                        thumb_img = ctk.CTkImage(light_image=img_obj, dark_image=img_obj, size=(300, 168))
+                        img_obj = Image.open(BytesIO(data)).convert("RGB")
+                        # Preserve aspect ratio — fit inside 300x168 without stretching
+                        target_w, target_h = 300, 168
+                        orig_w, orig_h = img_obj.size
+                        if orig_w > 0 and orig_h > 0:
+                            ratio = min(target_w / orig_w, target_h / orig_h)
+                            display_w = max(1, int(orig_w * ratio))
+                            display_h = max(1, int(orig_h * ratio))
+                        else:
+                            display_w, display_h = target_w, target_h
+                        thumb_img = ctk.CTkImage(light_image=img_obj, dark_image=img_obj,
+                                                  size=(display_w, display_h))
                 except Exception:
                     pass
 
@@ -422,67 +443,76 @@ class DyanmicPC(ctk.CTk):
         threading.Thread(target=fetch_worker, daemon=True).start()
 
     def _show_age_gate_panel(self, age_info: dict):
-        """Replace content_slot with age-gate setup instructions."""
         for w in self.content_slot.winfo_children():
             w.destroy()
 
         outer = ctk.CTkFrame(self.content_slot, fg_color="transparent")
-        outer.pack(fill="both", expand=True, padx=20, pady=20)
+        outer.pack(fill="both", expand=True, padx=4, pady=4)
 
         ctk.CTkLabel(
             outer,
             text=age_info.get("title", "Age-Restricted Video"),
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=ctk.CTkFont(size=18, weight="bold"),
             text_color=TEXT_MAIN,
         ).pack(anchor="w", pady=(0, 4))
 
         ctk.CTkLabel(
             outer,
-            text=age_info.get("subtitle", "One-time cookie setup required."),
-            font=ctk.CTkFont(size=13),
+            text=age_info.get("subtitle", "One-time setup needed."),
+            font=ctk.CTkFont(size=12),
             text_color=TEXT_MUTED,
-        ).pack(anchor="w", pady=(0, 16))
+        ).pack(anchor="w", pady=(0, 12))
 
         for i, step in enumerate(age_info.get("steps", []), 1):
             row = ctk.CTkFrame(outer, fg_color=CARD_BG, corner_radius=10)
-            row.pack(fill="x", pady=4, ipady=8)
+            row.pack(fill="x", pady=3, ipady=6)
             ctk.CTkLabel(
                 row, text=str(i),
-                font=ctk.CTkFont(size=13, weight="bold"),
-                text_color=TEAL_ACCENT, width=28,
-            ).pack(side="left", padx=(14, 8))
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=TEAL_ACCENT, width=26,
+            ).pack(side="left", padx=(12, 8))
             ctk.CTkLabel(
                 row, text=step,
-                font=ctk.CTkFont(size=12),
+                font=ctk.CTkFont(size=11),
                 text_color=TEXT_MAIN, justify="left",
-                anchor="w", wraplength=520,
-            ).pack(side="left", fill="x", expand=True, padx=(0, 14))
+                anchor="w", wraplength=500,
+            ).pack(side="left", fill="x", expand=True, padx=(0, 12))
 
         btn_row = ctk.CTkFrame(outer, fg_color="transparent")
-        btn_row.pack(fill="x", pady=(18, 0))
+        btn_row.pack(fill="x", pady=(14, 0))
         btn_row.grid_columnconfigure((0, 1), weight=1)
 
         def _open_ext():
             import webbrowser
-            webbrowser.open(age_info.get("extension_url", "https://youtube.com"))
+            _url = age_info.get("extension_url") or age_info.get("store") or ""
+            if _url and "youtube.com" not in _url:
+                webbrowser.open(_url)
+            else:
+                # Fallback: use age_gate's dynamic detection
+                try:
+                    from age_gate import get_setup_instructions
+                    instructions = get_setup_instructions()
+                    webbrowser.open(instructions["extension_url"])
+                except Exception:
+                    webbrowser.open("https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc")
 
         ctk.CTkButton(
             btn_row,
             text=f"Get Extension  ({age_info.get('browser', 'Browser')})",
-            height=44, corner_radius=22,
+            height=42, corner_radius=21,
             fg_color=TEAL_ACCENT, hover_color="#00A892", text_color="#000000",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             command=_open_ext,
-        ).grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
         ctk.CTkButton(
             btn_row, text="Back",
-            height=44, corner_radius=22,
+            height=42, corner_radius=21,
             fg_color="transparent", border_width=1, border_color=TEAL_ACCENT,
             hover_color="#222222", text_color=TEXT_MAIN,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             command=self._reset_home_view,
-        ).grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
     def _show_inline_error(self, err_text):
         for widget in self.content_slot.winfo_children():
@@ -530,7 +560,8 @@ class DyanmicPC(ctk.CTk):
         duration_sec = info.get("duration", 0)
 
         if duration_sec:
-            mins, secs = divmod(duration_sec, 60)
+            total_sec = int(duration_sec)
+            mins, secs = divmod(total_sec, 60)
             hrs, mins = divmod(mins, 60)
             duration_str = f"{hrs}:{mins:02d}:{secs:02d} mins" if hrs else f"{mins}:{secs:02d} mins"
         else:
@@ -618,6 +649,8 @@ class DyanmicPC(ctk.CTk):
 
             return options if options else ["Best Quality"]
 
+        audio_only_stream = info.get("_audio_only", False)
+
         if info.get("_video_formats"):
             _vf = info["_video_formats"]
             _af = info["_audio_formats"]
@@ -631,6 +664,9 @@ class DyanmicPC(ctk.CTk):
             formats = info.get("formats", []) if info else []
             video_qualities = extract_dynamic_qualities(formats, is_audio=False)
             audio_qualities = extract_dynamic_qualities(formats, is_audio=True)
+
+        if audio_only_stream:
+            video_qualities = []  # no video streams available for this source
 
         card_container = ctk.CTkFrame(
             self.desktop_card_frame, fg_color=CARD_BG, corner_radius=18, border_width=1, border_color="#2A2A2A"
@@ -672,22 +708,27 @@ class DyanmicPC(ctk.CTk):
         segment_frame.pack(fill="x", padx=24, pady=(10, 16))
         segment_frame.grid_columnconfigure((0, 1), weight=1)
 
+        # Disable Video tab for audio-only sources
+        if audio_only_stream:
+            mode_var.set("Audio")
+
         btn_mode_video = ctk.CTkButton(
             segment_frame,
             text="Video",
-            fg_color="#2B2B2B",
-            text_color=TEAL_ACCENT,
-            hover_color="#333333",
+            fg_color="#2B2B2B" if not audio_only_stream else "#1A1A1A",
+            text_color=TEAL_ACCENT if not audio_only_stream else "#444444",
+            hover_color="#333333" if not audio_only_stream else "#1A1A1A",
             corner_radius=10,
             height=44,
             font=ctk.CTkFont(size=16, weight="bold"),
+            state="normal" if not audio_only_stream else "disabled",
         )
         btn_mode_video.grid(row=0, column=0, padx=(0, 8), sticky="ew")
 
         btn_mode_audio = ctk.CTkButton(
             segment_frame,
             text="Audio",
-            fg_color="#0A0A0A",
+            fg_color="#2B2B2B" if audio_only_stream else "#0A0A0A",
             text_color=TEAL_ACCENT,
             hover_color="#181818",
             corner_radius=10,
@@ -700,9 +741,12 @@ class DyanmicPC(ctk.CTk):
         lbl_qual = ctk.CTkLabel(card_container, text="Quality", font=ctk.CTkFont(size=14), text_color=TEXT_MUTED, anchor="w")
         lbl_qual.pack(fill="x", padx=24, pady=(0, 6))
 
+        _default_q = audio_qualities if audio_only_stream else (video_qualities or ["Best Quality"])
+        _default_label = _default_q[0] if _default_q else "Best Quality"
+
         quality_menu = ctk.CTkOptionMenu(
             card_container,
-            values=video_qualities if video_qualities else ["Best Quality"],
+            values=_default_q,
             fg_color="#121212",
             button_color="#181818",
             button_hover_color="#252525",
@@ -713,10 +757,12 @@ class DyanmicPC(ctk.CTk):
             corner_radius=10,
             font=ctk.CTkFont(size=15, weight="bold"),
         )
-        quality_menu.set(video_qualities[0] if video_qualities else "Best Quality")
+        quality_menu.set(_default_label)
         quality_menu.pack(fill="x", padx=24, pady=(0, 20))
 
         def set_mode(mode):
+            if audio_only_stream and mode == "Video":
+                return  # no video streams for this source
             mode_var.set(mode)
             if mode == "Video":
                 btn_mode_video.configure(fg_color="#2B2B2B")
@@ -725,7 +771,7 @@ class DyanmicPC(ctk.CTk):
                 quality_menu.set(video_qualities[0] if video_qualities else "Best Quality")
             else:
                 btn_mode_audio.configure(fg_color="#2B2B2B")
-                btn_mode_video.configure(fg_color="#0A0A0A")
+                btn_mode_video.configure(fg_color="#0A0A0A" if not audio_only_stream else "#1A1A1A")
                 quality_menu.configure(state="normal", values=audio_qualities if audio_qualities else ["Best Audio"])
                 quality_menu.set(audio_qualities[0] if audio_qualities else "Best Audio")
 
