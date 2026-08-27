@@ -1,15 +1,20 @@
 # universal_scraper.py
 # --------------------
-# Handles ALL non-YouTube URLs using yt-dlp's built-in extractor system.
-# Inspired by dsymbol/yt-dlp-gui — uses --progress-template with __SEP__
-# delimiters instead of fragile regex parsing of mixed stderr/stdout.
+# Handles ALL non-YouTube URLs. yt-dlp's 1800+ site extractors + GenericIE
+# fallback do the heavy lifting. No YouTube-specific flags here.
 #
-# yt-dlp handles 1800+ sites automatically via site-specific extractors
-# and a GenericIE fallback. We don't need YouTube-specific flags here.
+# Fixes vs previous version:
+# - _is_audio_only correctly handles muxed formats (checks height AND vcodec)
+# - Hardcoded fallback qualities when site returns 0 formats
+# - Normalised audio labels (no MPA/mp4a/m4a confusion)
+# - PH/adult sites: referer header + --no-check-certificate
+# - --progress-template __SEP__ approach for reliable progress parsing
+# - Audio tab always shows real bitrate options or hardcoded fallback list
 
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -22,11 +27,34 @@ _YT_DOMAINS = (
     "music.youtube.com", "m.youtube.com",
 )
 
-PROGRESS_SEP = "__SEP__"
+_ADULT_DOMAINS = (
+    "pornhub.com", "xvideos.com", "xhamster.com", "redtube.com",
+    "youporn.com", "spankbang.com", "eporner.com", "xnxx.com",
+    "tnaflix.com", "tube8.com",
+)
+
+_SEP = "__SEP__"
+
+# Hardcoded fallbacks — shown when a site returns no parseable formats
+_FALLBACK_VIDEO = [
+    {"label": "1080p", "format_id": None},
+    {"label": "720p",  "format_id": None},
+    {"label": "480p",  "format_id": None},
+    {"label": "360p",  "format_id": None},
+]
+
+_FALLBACK_AUDIO = [
+    {"label": f"MP3 ({br}kbps)", "format_id": None}
+    for br in (320, 256, 192, 128, 96, 64)
+]
 
 
 def is_youtube_url(url: str) -> bool:
     return any(d in url.lower() for d in _YT_DOMAINS)
+
+
+def _is_adult_url(url: str) -> bool:
+    return any(d in url.lower() for d in _ADULT_DOMAINS)
 
 
 def _find_binary(name: str):
@@ -47,13 +75,11 @@ def _ytdlp() -> str:
 
 def _ffprobe_args() -> list:
     p = _find_binary("ffprobe")
-    if p:
-        return ["--ffprobe-location", p]
-    return []
+    return ["--ffprobe-location", p] if p else []
 
 
 def _cookie_args() -> list:
-    cookie_file = Path(__file__).resolve().parent / "session_cookies.txt"
+    cookie_file = Path.home() / "Downloads" / "dynamic_cookies.txt"
     if cookie_file.exists():
         return ["--cookies", str(cookie_file)]
     return []
@@ -75,109 +101,115 @@ def _size_label(size_bytes, duration_sec, tbr, abr) -> str:
     return f"~{round(size_bytes / (1024 * 1024), 1)} MB"
 
 
-_FALLBACK_VIDEO = [
-    {"label": "1080p", "format_id": None},
-    {"label": "720p",  "format_id": None},
-    {"label": "480p",  "format_id": None},
-    {"label": "360p",  "format_id": None},
-]
-_FALLBACK_AUDIO = [
-    {"label": f"MP3 ({br}kbps)", "format_id": None}
-    for br in (320, 256, 192, 128, 96, 64)
-]
+def _normalize_audio_label(ext: str, acodec: str, abr: int) -> str:
+    """Convert codec/ext names to clean readable labels."""
+    ext = (ext or "").lower()
+    acodec = (acodec or "").lower()
+    if "mp4a" in acodec or "aac" in acodec or ext in ("m4a", "mp4a"):
+        fmt = "AAC"
+    elif "mp3" in acodec or ext in ("mp3", "mpa"):
+        fmt = "MP3"
+    elif "opus" in acodec or ext == "opus":
+        fmt = "Opus"
+    elif "vorbis" in acodec or ext in ("ogg", "oga"):
+        fmt = "OGG"
+    elif "flac" in acodec or ext == "flac":
+        fmt = "FLAC"
+    elif ext == "webm":
+        fmt = "WebM"
+    else:
+        fmt = ext.upper() if ext else "Audio"
+    return f"{fmt} ({abr}kbps)" if abr else fmt
 
 
-def _parse_video_formats(formats, duration_sec):
-    video = [
-        f for f in formats
-        if f.get("height") and f.get("vcodec") not in (None, "none")
-        and f.get("ext") not in ("mhtml",)
-    ]
-    video.sort(key=lambda f: (f.get("height", 0), f.get("fps") or 0,
+def _has_video_stream(f: dict) -> bool:
+    """True if this format has a real video track."""
+    vcodec = (f.get("vcodec") or "none").lower().strip()
+    height = f.get("height") or 0
+    return height > 0 or vcodec not in ("none", "", "null")
+
+
+def _is_audio_only(formats: list) -> bool:
+    """True only when no format has any video stream at all."""
+    if not formats:
+        return False
+    return not any(_has_video_stream(f) for f in formats)
+
+
+def _parse_video_formats(formats: list, duration_sec: int) -> list:
+    video = [f for f in formats if f and _has_video_stream(f) and f.get("ext") != "mhtml"]
+    video.sort(key=lambda f: (f.get("height") or 0, f.get("fps") or 0,
                                f.get("tbr") or 0), reverse=True)
     seen, result = set(), []
     for f in video:
-        height, fps = f.get("height"), f.get("fps") or 0
+        height = f.get("height") or 0
+        fps = f.get("fps") or 0
         if (height, int(fps)) in seen:
             continue
         seen.add((height, int(fps)))
         fps_str = f"{int(fps)}fps" if fps > 30 else ""
-        res = f"4K ({height}p)" if height >= 2160 else f"{height}p"
+        res = f"4K ({height}p)" if height >= 2160 else (f"{height}p" if height else "Best")
         label_base = " ".join(p for p in [res, fps_str] if p)
         size_str = _size_label(f.get("filesize") or f.get("filesize_approx"),
                                 duration_sec, f.get("tbr"), None)
         label = f"{label_base} — {size_str}" if size_str else label_base
-        result.append({"label": label, "format_id": f["format_id"]})
-    # If only 1 format returned, show it but also offer fallback resolutions
+        result.append({"label": label, "format_id": f.get("format_id")})
+
     return result if result else _FALLBACK_VIDEO
 
 
-def _parse_audio_formats(formats, duration_sec):
+def _parse_audio_formats(formats: list, duration_sec: int) -> list:
     audio = [
         f for f in formats
-        if f.get("vcodec") in (None, "none")
-        and f.get("acodec") not in (None, "none")
-        and f.get("ext") not in ("mhtml",)
+        if (f.get("vcodec") or "none").lower() in ("none", "", "null")
+        and (f.get("acodec") or "none").lower() not in ("none", "", "null")
+        and f.get("ext") != "mhtml"
     ]
     audio.sort(key=lambda f: f.get("abr") or 0, reverse=True)
     seen, result = set(), []
     for f in audio:
         abr = int(f.get("abr") or 0)
-        ext = (f.get("ext") or "m4a").upper()
-        if (abr, ext) in seen:
+        label_base = _normalize_audio_label(f.get("ext") or "", f.get("acodec") or "", abr)
+        if label_base in seen:
             continue
-        seen.add((abr, ext))
-        label_base = f"{ext} ({abr}kbps)" if abr else ext
+        seen.add(label_base)
         size_str = _size_label(f.get("filesize") or f.get("filesize_approx"),
                                 duration_sec, None, f.get("abr"))
         label = f"{label_base} — {size_str}" if size_str else label_base
-        result.append({"label": label, "format_id": f["format_id"]})
-    return result or _FALLBACK_AUDIO
+        result.append({"label": label, "format_id": f.get("format_id")})
+
+    return result if result else _FALLBACK_AUDIO
 
 
-def _is_audio_only(formats) -> bool:
-    """Return True only if EVERY format is audio-only with no video stream at all.
-    Muxed formats (vcodec != none AND acodec != none) count as video-capable."""
-    if not formats:
-        return False
-    for f in formats:
-        vcodec = f.get("vcodec") or "none"
-        height = f.get("height") or 0
-        # Has a real video stream
-        if height > 0 or vcodec not in ("none", ""):
-            return False
-    return True
+def _base_cmd(url: str) -> list:
+    cmd = [
+        _ytdlp(),
+        "--no-playlist", "--no-warnings",
+        "--no-check-certificate",
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
+    if _is_adult_url(url):
+        cmd += ["--add-header", f"Referer:{url}",
+                "--add-header", "Accept-Language:en-US,en;q=0.9"]
+    cmd.extend(_ffprobe_args())
+    cmd.extend(_cookie_args())
+    return cmd
 
 
 def scrape_formats(url: str) -> dict:
-    """
-    Fetch metadata for any non-YouTube URL.
-    Uses yt-dlp's built-in extractor — no YouTube-specific flags.
-    """
-    cmd = [
-        _ytdlp(), "--dump-json", "--no-playlist", "--no-warnings", "--quiet",
-        "--no-check-certificate",   # PH and some adult sites use cert issues
-        "--user-agent", (            # generic UA avoids some site-level blocks
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        ),
-    ]
-    cmd.extend(_ffprobe_args())
-    cmd.extend(_cookie_args())
-    cmd.append(url)
-
+    cmd = _base_cmd(url) + ["--dump-json", "--quiet", url]
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=60, creationflags=_no_window(),
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=25, creationflags=_no_window())
     except FileNotFoundError as e:
         return {"ok": False, "error": str(e)}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "Timed out fetching video info"}
 
     if proc.returncode != 0:
-        err = (proc.stderr or "").strip()
+        err = re.sub(r"\x1b\[[0-9;]*m", "", (proc.stderr or "").strip())
         return {"ok": False, "error": err[:200] or "yt-dlp returned an error"}
 
     try:
@@ -204,11 +236,6 @@ def scrape_formats(url: str) -> dict:
 
 def scrape_download(url: str, format_id=None, out_dir: str = "downloads",
                     is_audio: bool = False, selected_fid=None) -> Iterator[dict]:
-    """
-    Download from any non-YouTube URL.
-    Uses --progress-template with __SEP__ delimiters (dsymbol/yt-dlp-gui approach)
-    — clean, reliable, no dual-stream threading needed.
-    """
     if selected_fid is not None:
         format_id = selected_fid
 
@@ -222,42 +249,29 @@ def scrape_download(url: str, format_id=None, out_dir: str = "downloads",
                if format_id else "bestvideo+bestaudio/best")
         extra = ["--merge-output-format", "mp4"]
 
-    # --progress-template gives us structured output on stdout.
-    # Much more reliable than parsing free-text progress lines.
     progress_tmpl = (
-        f"%(progress.status)s{PROGRESS_SEP}"
-        f"%(progress._total_bytes_estimate_str)s{PROGRESS_SEP}"
-        f"%(progress._percent_str)s{PROGRESS_SEP}"
-        f"%(progress._speed_str)s{PROGRESS_SEP}"
+        f"%(progress.status)s{_SEP}"
+        f"%(progress._total_bytes_estimate_str)s{_SEP}"
+        f"%(progress._percent_str)s{_SEP}"
+        f"%(progress._speed_str)s{_SEP}"
         f"%(progress._eta_str)s"
     )
 
-    cmd = [
-        _ytdlp(),
-        "--no-playlist", "--no-warnings",
+    cmd = _base_cmd(url) + [
         "--newline", "--progress",
         "--progress-template", progress_tmpl,
+        "--concurrent-fragments", "4",  # parallel fragment downloads = faster
         "-o", os.path.join(out_dir, "%(title)s.%(ext)s"),
         "-f", fmt,
-    ]
-    cmd.extend(extra)
-    cmd.extend(_ffprobe_args())
-    cmd.extend(_cookie_args())
-    cmd.append(url)
+    ] + extra + [url]
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=_no_window(),
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, creationflags=_no_window())
     except FileNotFoundError as e:
         yield {"type": "error", "message": str(e)}
         return
 
-    # stderr reader — only for detecting errors, not progress
     err_lines = []
     def _read_err():
         for line in proc.stderr:
@@ -268,37 +282,29 @@ def scrape_download(url: str, format_id=None, out_dir: str = "downloads",
         line = line.strip()
         if not line:
             continue
-
-        if PROGRESS_SEP in line:
-            parts = [p.strip() for p in line.split(PROGRESS_SEP)]
+        if _SEP in line:
+            parts = [p.strip() for p in line.split(_SEP)]
             if len(parts) >= 5:
-                status, total_bytes, percent_str, speed, eta = parts[:5]
+                _, _, pct_str, speed, eta = parts[:5]
                 try:
-                    percent = float(percent_str.replace("%", "").strip()) / 100.0
+                    pct = float(pct_str.replace("%", "").strip()) / 100.0
                 except (ValueError, AttributeError):
-                    percent = 0.0
-                yield {
-                    "type":    "progress",
-                    "percent": min(percent, 1.0),
-                    "speed":   speed if speed != "N/A" else "",
-                    "eta":     eta if eta != "N/A" else "",
-                    "size":    total_bytes if total_bytes != "N/A" else "",
-                }
-            continue
-
-        if line.startswith(("[Merger]", "[ExtractAudio]", "[ffmpeg]")):
+                    pct = 0.0
+                yield {"type": "progress", "percent": min(pct, 1.0),
+                       "speed": speed if speed != "N/A" else "",
+                       "eta":   eta   if eta   != "N/A" else ""}
+        elif line.startswith(("[Merger]", "[ExtractAudio]", "[ffmpeg]")):
             yield {"type": "merging"}
 
     proc.wait()
-
     if proc.returncode == 0:
         yield {"type": "done"}
     else:
-        err_msg = "\n".join(err_lines).strip()
-        yield {"type": "error", "message": err_msg[:200] or f"yt-dlp exited with code {proc.returncode}"}
+        err = "\n".join(err_lines).strip()
+        yield {"type": "error", "message": err[:200] or f"yt-dlp exited {proc.returncode}"}
 
 
-# Aliases for compatibility
+# Aliases
 fetch_formats = scrape_formats
 download_video = scrape_download
 fetcher_download = scrape_download

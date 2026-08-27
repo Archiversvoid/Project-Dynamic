@@ -1,15 +1,14 @@
 # age_gate.py
 # -----------
-# Detects age-restricted YouTube videos and manages cookie authentication.
-# Dynamic browser detection — uses whatever browser the user has installed.
+# Detects age-restricted videos and manages cookie auth.
+# Dynamic browser detection via Windows registry — no hardcoded Firefox.
+# Cookie file lives in Downloads so the path doesn't break when app moves.
 
 import sys
-import winreg
 from datetime import datetime
 from pathlib import Path
 
-# Cookie file lives in user's Downloads so it's easy to find and
-# stays valid after the app moves from development to final location
+# Cookie file in user's Downloads — easy to find, path-independent
 COOKIE_FILE = Path.home() / "Downloads" / "dynamic_cookies.txt"
 
 _AGE_SIGNALS = (
@@ -23,14 +22,16 @@ _AGE_SIGNALS = (
     "login_required",
 )
 
+# Verified working extension URLs (2026)
+# "Get cookies.txt LOCALLY" is the safe open-source version
 _BROWSER_EXTENSIONS = {
     "chrome": {
         "name": "Get cookies.txt LOCALLY",
-        "store": "https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
+        "store": "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
     },
     "edge": {
         "name": "Get cookies.txt LOCALLY",
-        "store": "https://microsoftedge.microsoft.com/addons/detail/get-cookiestxt-locally/helipeccjnbmbhmenmfgjlknfkjihiaf",
+        "store": "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
     },
     "firefox": {
         "name": "cookies.txt",
@@ -38,11 +39,11 @@ _BROWSER_EXTENSIONS = {
     },
     "brave": {
         "name": "Get cookies.txt LOCALLY",
-        "store": "https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
+        "store": "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
     },
     "opera": {
         "name": "Get cookies.txt LOCALLY",
-        "store": "https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
+        "store": "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
     },
 }
 
@@ -88,36 +89,32 @@ def cookie_file_age_days():
 
 
 def _detect_default_browser() -> str:
-    """Try to detect the user's default browser from Windows registry.
-    Falls back to checking installed browser paths."""
+    """Detect the user's default browser from Windows registry first,
+    then fall back to checking installed browser directories."""
     if sys.platform == "win32":
         try:
+            import winreg
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
+                r"Software\Microsoft\Windows\Shell\Associations"
+                r"\UrlAssociations\https\UserChoice"
             )
             prog_id, _ = winreg.QueryValueEx(key, "ProgId")
             winreg.CloseKey(key)
             prog_id = prog_id.lower()
-            if "chrome" in prog_id:
-                return "chrome"
-            if "edge" in prog_id or "msedge" in prog_id:
-                return "edge"
-            if "firefox" in prog_id:
-                return "firefox"
-            if "brave" in prog_id:
-                return "brave"
-            if "opera" in prog_id:
-                return "opera"
+            for name in ("chrome", "edge", "firefox", "brave", "opera"):
+                if name in prog_id or (name == "edge" and "msedge" in prog_id):
+                    return name
         except Exception:
             pass
 
-    # Fallback: check which browsers are installed, prefer Chrome
-    for browser in ("chrome", "edge", "firefox", "brave", "opera"):
-        if _BROWSER_PATHS[browser].exists():
-            return browser
+        # Registry failed — check which browsers are installed
+        for browser in ("chrome", "edge", "firefox", "brave", "opera"):
+            if _BROWSER_PATHS[browser].exists():
+                return browser
 
-    return "chrome"  # last resort — tell them to install Chrome
+    # Non-Windows or nothing found — default to Chrome
+    return "chrome"
 
 
 def get_cookie_args() -> list:
@@ -127,23 +124,23 @@ def get_cookie_args() -> list:
 
 
 def get_setup_instructions(browser: str = None) -> dict:
-    if browser is None:
+    if not browser:
         browser = _detect_default_browser()
     ext = _BROWSER_EXTENSIONS.get(browser, _BROWSER_EXTENSIONS["chrome"])
     cookie_path = str(COOKIE_FILE)
 
     steps = [
-        f"Open {browser.title()} and make sure you're logged into YouTube.",
+        f"Open {browser.title()} and sign into YouTube.",
         f'Install the "{ext["name"]}" extension:\n{ext["store"]}',
-        "Go to https://www.youtube.com (the homepage, not a specific video).",
-        'Click the extension icon and choose "Export" or "Download cookies.txt".',
-        f"Save the file here (exact name matters):\n{cookie_path}",
-        "Come back and try the download again — it will work automatically.",
+        "Go to https://www.youtube.com (homepage, not a video).",
+        'Click the extension icon → "Export" or "Download as cookies.txt".',
+        f"Save the file with this exact name and location:\n{cookie_path}",
+        "Try the download again — it will work automatically from now on.",
     ]
 
     return {
         "title": "Age-Restricted Video",
-        "subtitle": "One-time setup needed. Cookies stay valid for weeks.",
+        "subtitle": "One-time setup. Cookies stay valid for weeks.",
         "steps": steps,
         "cookie_path": cookie_path,
         "extension_url": ext["store"],
@@ -173,11 +170,12 @@ def check_and_handle(stdout: str, stderr: str) -> dict:
         }
 
     browser = _detect_default_browser()
+    instructions = get_setup_instructions(browser)
     return {
         "type": "age_restricted",
         "has_cookies": False,
         "cookies_may_be_expired": False,
         "days_old": None,
-        "instructions": get_setup_instructions(browser),
+        "instructions": instructions,
         "message": "This video is age-restricted. One-time setup required.",
     }
