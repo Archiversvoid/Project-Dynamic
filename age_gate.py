@@ -72,7 +72,7 @@ def cookie_file_valid() -> bool:
         if line.startswith("#") or not line.strip():
             continue
         parts = line.strip().split("\t")
-        if len(parts) >= 7 and "youtube" in parts[0].lower():
+        if len(parts) >= 7 and "youtube" in parts[0].lower().lstrip("."):
             try:
                 expiry = int(parts[4])
                 if expiry == 0 or expiry > now:

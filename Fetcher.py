@@ -91,6 +91,7 @@ def _parse_video_formats(formats: list, duration_sec: int) -> list:
 
 
 def _parse_audio_formats(formats: list, duration_sec: int) -> list:
+    """Show audio streams as MP3 bitrate options only — yt-dlp converts on download."""
     audio = [
         f for f in formats
         if f.get("vcodec") in (None, "none")
@@ -98,19 +99,23 @@ def _parse_audio_formats(formats: list, duration_sec: int) -> list:
         and f.get("ext") not in ("mhtml",)
     ]
     audio.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-    seen, result = set(), []
+    seen_abr, result = set(), []
     for f in audio:
         abr = int(f.get("abr") or 0)
-        ext = (f.get("ext") or "m4a").upper()
-        if (abr, ext) in seen:
+        if not abr or abr in seen_abr:
             continue
-        seen.add((abr, ext))
-        label_base = f"{ext} ({abr}kbps)" if abr else ext
+        seen_abr.add(abr)
         size_str = _size_label(f.get("filesize") or f.get("filesize_approx"),
                                 duration_sec, None, f.get("abr"))
-        label = f"{label_base} — {size_str}" if size_str else label_base
+        label = f"MP3 {abr}kbps"
+        if size_str:
+            label += f" — {size_str}"
         result.append({"label": label, "format_id": f["format_id"]})
-    return result or [{"label": "Best Audio", "format_id": None}]
+    # Hardcoded fallback if no audio streams found
+    return result or [
+        {"label": f"MP3 {br}kbps", "format_id": None}
+        for br in (320, 256, 192, 128, 96, 64)
+    ]
 
 
 def fetch_formats(url: str) -> dict:
@@ -236,18 +241,20 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
 
     if is_audio:
         fmt = f"{format_id}/bestaudio/best" if format_id else "bestaudio/best"
-        extra = ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "320K"]
+        extra = [
+            "--extract-audio", "--audio-format", "mp3", "--audio-quality", "320K",
+            "--embed-thumbnail",       # embed thumbnail as album art
+            "--add-metadata",          # write title/artist/album metadata
+            "--convert-thumbnails", "jpg",  # ensure thumbnail is compatible
+            "--postprocessor-args", "ffmpeg:-id3v2_version 3",  # fix ID3 tags for Windows
+        ]
     else:
         fmt = (f"{format_id}+bestaudio/bestvideo+bestaudio/best"
                if format_id else "bestvideo+bestaudio/best")
         extra = ["--merge-output-format", "mp4"]
 
-    progress_tmpl = (
-        f"%(progress.status)s{_SEP}"
-        f"%(progress._total_bytes_estimate_str)s{_SEP}"
-        f"%(progress._percent_str)s{_SEP}"
-        f"%(progress._speed_str)s{_SEP}"
-        f"%(progress._eta_str)s"
+    _progress_re = re.compile(
+        r"\[download\]\s+([\d.]+)%\s+of\s+[\d.~]+\s*\S+\s+at\s+(\S+)(?:\s+ETA\s+(\S+))?"
     )
 
     def _build_dl_cmd(client, use_cookies):
@@ -257,7 +264,6 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
             "--extractor-args", f"youtube:player_client={client}",
             "--extractor-args", "youtube:formats=missing_pot",
             "--newline", "--progress",
-            "--progress-template", progress_tmpl,
             "-o", os.path.join(out_dir, "%(title)s.%(ext)s"),
             "-f", fmt,
         ]
@@ -296,18 +302,16 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
             line = line.strip()
             if not line:
                 continue
-            if _SEP in line:
-                parts = [p.strip() for p in line.split(_SEP)]
-                if len(parts) >= 5:
-                    _, _, pct_str, speed, eta = parts[:5]
-                    try:
-                        pct = float(pct_str.replace("%", "").strip()) / 100.0
-                    except (ValueError, AttributeError):
-                        pct = 0.0
-                    got_progress = True
-                    yield {"type": "progress", "percent": min(pct, 1.0),
-                           "speed": speed if speed != "N/A" else "",
-                           "eta":   eta   if eta   != "N/A" else ""}
+            m = _progress_re.search(line)
+            if m:
+                try:
+                    pct = float(m.group(1)) / 100.0
+                except (ValueError, AttributeError):
+                    pct = 0.0
+                got_progress = True
+                yield {"type": "progress", "percent": min(pct, 1.0),
+                       "speed": m.group(2) or "",
+                       "eta":   m.group(3) or ""}
             elif line.startswith(("[Merger]", "[ExtractAudio]", "[ffmpeg]")):
                 yield {"type": "merging"}
 
