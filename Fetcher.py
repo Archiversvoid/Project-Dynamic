@@ -1,8 +1,6 @@
 # Fetcher.py
 # ----------
 # Calls yt-dlp directly as a subprocess for YouTube.
-# No bot_guard strategy rotation — that was causing slow processing and frozen downloads.
-# Uses tv_embedded client (fastest, full format list, no PO token needed).
 
 import json
 import os
@@ -44,8 +42,20 @@ def _js_args() -> list:
 
 def _cookie_args() -> list:
     cookie_file = Path.home() / "Downloads" / "dynamic_cookies.txt"
-    if cookie_file.exists():
+    if cookie_file.exists() and cookie_file.stat().st_size > 500:
         return ["--cookies", str(cookie_file)]
+    return []
+
+
+def _browser_cookie_args() -> list:
+    if sys.platform != "win32":
+        return []
+    for browser, path in [
+        ("edge",   Path.home() / "AppData/Local/Microsoft/Edge"),
+        ("chrome", Path.home() / "AppData/Local/Google/Chrome"),
+    ]:
+        if path.exists():
+            return ["--cookies-from-browser", browser]
     return []
 
 
@@ -53,11 +63,28 @@ def _no_window() -> int:
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
-def _size_label(size_bytes, duration_sec, tbr, abr) -> str:
+def _size_label(f: dict, duration_sec: int, is_video: bool = False) -> str:
+    size_bytes = f.get("filesize") or f.get("filesize_approx")
     if not size_bytes and duration_sec:
-        rate = tbr or abr or 0
+        height = f.get("height") or 0
+        rate = f.get("tbr") or f.get("vbr") or f.get("abr") or 0
+        
+        if not rate:
+            if is_video:
+                if height >= 2160: rate = 8000
+                elif height >= 1440: rate = 4000
+                elif height >= 1080: rate = 1800
+                elif height >= 720: rate = 900
+                elif height >= 480: rate = 500
+                elif height > 0: rate = 300
+            else:
+                rate = f.get("abr") or 128
+
         if rate:
+            if is_video and f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none"):
+                rate += 128
             size_bytes = int(duration_sec * rate * 1000 / 8)
+
     if not size_bytes:
         return ""
     if size_bytes < 1024 * 1024:
@@ -73,7 +100,7 @@ def _parse_video_formats(formats: list, duration_sec: int) -> list:
         and f.get("ext") not in ("mhtml",)
     ]
     video.sort(key=lambda f: (f.get("height", 0), f.get("fps") or 0,
-                               f.get("tbr") or 0), reverse=True)
+                               f.get("tbr") or f.get("vbr") or 0), reverse=True)
     seen, result = set(), []
     for f in video:
         height, fps = f.get("height"), f.get("fps") or 0
@@ -83,35 +110,31 @@ def _parse_video_formats(formats: list, duration_sec: int) -> list:
         fps_str = f"{int(fps)}fps" if fps > 30 else ""
         res_label = f"4K ({height}p)" if height >= 2160 else f"{height}p"
         label_base = " ".join(p for p in [res_label, fps_str] if p)
-        size_str = _size_label(f.get("filesize") or f.get("filesize_approx"),
-                                duration_sec, f.get("tbr"), None)
+        size_str = _size_label(f, duration_sec, is_video=True)
         label = f"{label_base} — {size_str}" if size_str else label_base
-        result.append({"label": label, "format_id": f["format_id"]})
+        result.append({"label": label, "format_id": f["format_id"], "filesize": f.get("filesize") or f.get("filesize_approx")})
     return result or [{"label": "Best Quality", "format_id": None}]
 
 
 def _parse_audio_formats(formats: list, duration_sec: int) -> list:
-    """Show audio streams as MP3 bitrate options only — yt-dlp converts on download."""
     audio = [
         f for f in formats
         if f.get("vcodec") in (None, "none")
         and f.get("acodec") not in (None, "none")
         and f.get("ext") not in ("mhtml",)
     ]
-    audio.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+    audio.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
     seen_abr, result = set(), []
     for f in audio:
-        abr = int(f.get("abr") or 0)
+        abr = int(f.get("abr") or f.get("tbr") or 0)
         if not abr or abr in seen_abr:
             continue
         seen_abr.add(abr)
-        size_str = _size_label(f.get("filesize") or f.get("filesize_approx"),
-                                duration_sec, None, f.get("abr"))
+        size_str = _size_label(f, duration_sec, is_video=False)
         label = f"MP3 {abr}kbps"
         if size_str:
             label += f" — {size_str}"
-        result.append({"label": label, "format_id": f["format_id"]})
-    # Hardcoded fallback if no audio streams found
+        result.append({"label": label, "format_id": f["format_id"], "filesize": f.get("filesize") or f.get("filesize_approx")})
     return result or [
         {"label": f"MP3 {br}kbps", "format_id": None}
         for br in (320, 256, 192, 128, 96, 64)
@@ -119,121 +142,91 @@ def _parse_audio_formats(formats: list, duration_sec: int) -> list:
 
 
 def fetch_formats(url: str) -> dict:
-    """
-    Fetch YouTube video metadata + full format list.
-    Uses tv_embedded client directly — fastest client that returns full
-    DASH format list without needing a PO token.
-    Falls back to web client if tv_embedded returns no high-res formats.
-    """
-    # (client, with_cookies)
-    attempts = [
-        ("tv_embedded", False),
-        ("tv_embedded", True),
-        ("web",         False),
-        ("web",         True),
-        ("android",     False),
-    ]
     last_err = ""
-    for client, use_cookies in attempts:
+
+    def _run_fetch(extra_args, timeout=15):
         cmd = [
-            _ytdlp(),
-            "--dump-json", "--no-playlist", "--no-warnings", "--quiet",
-            "--extractor-args", f"youtube:player_client={client}",
+            _ytdlp(), "--dump-json", "--no-playlist", "--no-warnings", "--quiet",
+            "--extractor-args", "youtube:player_client=tv_embedded",
             "--extractor-args", "youtube:formats=missing_pot",
-        ]
-        cmd.extend(_js_args())
-        if use_cookies:
-            cmd.extend(_cookie_args())
-        cmd.append(url)
-
+        ] + _js_args() + extra_args + [url]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=20, creationflags=_no_window())
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout, creationflags=_no_window())
         except subprocess.TimeoutExpired:
-            continue
+            return None
         except FileNotFoundError as e:
-            return {"ok": False, "error": str(e)}
+            return e
 
-        combined = (proc.stdout + proc.stderr).lower()
-        last_err = re.sub(r"\x1b\[[0-9;]*m", "", (proc.stderr or "").strip())
-
-        # Age-restricted check
-        if any(s in combined for s in ("confirm your age", "age-restricted",
-                "login_required", "sign in to confirm", "inappropriate for some")):
-            # Try with cookies immediately before giving up
-            cookie_list = _cookie_args()
-            if cookie_list and not use_cookies:
-                cmd_ck = [
-                    _ytdlp(), "--dump-json", "--no-playlist", "--no-warnings", "--quiet",
-                    "--extractor-args", f"youtube:player_client={client}",
-                    "--extractor-args", "youtube:formats=missing_pot",
-                ] + _js_args() + cookie_list + [url]
-                try:
-                    p2 = subprocess.run(cmd_ck, capture_output=True, text=True,
-                                        timeout=20, creationflags=_no_window())
-                    if p2.returncode == 0:
-                        info2 = json.loads(p2.stdout)
-                        raw2 = info2.get("duration")
-                        dur2 = int(raw2) if raw2 is not None else 0
-                        fmts2 = info2.get("formats") or []
-                        return {
-                            "ok": True,
-                            "title":         info2.get("title", "Unknown Title"),
-                            "channel":       info2.get("uploader") or info2.get("channel") or "Unknown",
-                            "duration":      dur2,
-                            "thumbnail":     info2.get("thumbnail"),
-                            "video_formats": _parse_video_formats(fmts2, dur2),
-                            "audio_formats": _parse_audio_formats(fmts2, dur2),
-                        }
-                except Exception:
-                    pass
-            # Cookies didn't work or not available — show setup instructions
-            try:
-                from age_gate import check_and_handle
-                age_info = check_and_handle(proc.stdout, proc.stderr)
-                if age_info.get("type") == "age_restricted":
-                    return {"ok": False, "error": age_info["message"], "age_gate": age_info}
-            except ImportError:
-                pass
-            return {"ok": False, "error": "Age-restricted video. Cookie setup required."}
-
+    def _parse_proc(proc):
+        if proc is None or isinstance(proc, Exception):
+            return None
         if proc.returncode != 0:
-            continue  # 403 or other — try next attempt
-
+            return None
         try:
             info = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            continue
+            raw_dur = info.get("duration")
+            duration = int(raw_dur) if raw_dur is not None else 0
+            formats = info.get("formats") or []
+            is_live = bool(info.get("is_live")) or info.get("live_status") in ("is_live", "is_upcoming")
+            return {
+                "ok":            True,
+                "title":         info.get("title", "Unknown Title"),
+                "channel":       info.get("uploader") or info.get("channel") or "Unknown",
+                "duration":      duration,
+                "is_live":       is_live,
+                "thumbnail":     info.get("thumbnail"),
+                "video_formats": _parse_video_formats(formats, duration),
+                "audio_formats": _parse_audio_formats(formats, duration),
+            }
+        except Exception:
+            return None
 
-        raw_dur = info.get("duration")
-        duration = int(raw_dur) if raw_dur is not None else 0
-        formats = info.get("formats") or []
+    proc = _run_fetch([])
+    result = _parse_proc(proc)
+    if result:
+        return result
 
-        # Make sure we got real high-res formats, not just 360p fallback
-        has_hq = any((f.get("height") or 0) > 360 and f.get("vcodec") not in (None, "none")
-                     for f in formats)
-        if not has_hq and client != "android":
-            continue  # try next client for better formats
+    combined = ((proc.stdout if proc and not isinstance(proc, Exception) else "") +
+                (proc.stderr if proc and not isinstance(proc, Exception) else "")).lower()
+    is_age = any(s in combined for s in ("confirm your age", "age-restricted",
+                                          "login_required", "sign in to confirm"))
 
-        return {
-            "ok":            True,
-            "title":         info.get("title", "Unknown Title"),
-            "channel":       info.get("uploader") or info.get("channel") or "Unknown",
-            "duration":      duration,
-            "thumbnail":     info.get("thumbnail"),
-            "video_formats": _parse_video_formats(formats, duration),
-            "audio_formats": _parse_audio_formats(formats, duration),
-        }
+    if is_age:
+        for extra in [_cookie_args(), _browser_cookie_args()]:
+            if not extra:
+                continue
+            p2 = _run_fetch(extra, timeout=20)
+            r2 = _parse_proc(p2)
+            if r2:
+                return r2
+        try:
+            from age_gate import check_and_handle, get_setup_instructions
+            age_info = check_and_handle(
+                proc.stdout if proc and not isinstance(proc, Exception) else "",
+                proc.stderr if proc and not isinstance(proc, Exception) else "")
+            if not age_info.get("instructions"):
+                age_info["instructions"] = get_setup_instructions()
+            return {"ok": False, "error": age_info.get("message", "Age-restricted"),
+                    "age_gate": age_info}
+        except Exception:
+            pass
+        return {"ok": False, "error": "Age-restricted. Export cookies and try again.",
+                "age_gate": {"type": "age_restricted", "has_cookies": bool(_cookie_args()),
+                             "instructions": None, "message": "Age-restricted."}}
 
-    return {"ok": False, "error": last_err[:200] if last_err else "Could not fetch video info after all attempts"}
+    proc2 = _run_fetch(["--extractor-args", "youtube:player_client=web"], timeout=15)
+    result2 = _parse_proc(proc2)
+    if result2:
+        return result2
+
+    last_err = re.sub(r"\x1b\[[0-9;]*m", "",
+                      (proc.stderr if proc and not isinstance(proc, Exception) else "").strip())
+    return {"ok": False, "error": last_err[:200] or "Could not fetch video info"}
 
 
 def download_video(url: str, format_id=None, out_dir: str = "downloads",
                    is_audio: bool = False, selected_fid=None) -> Iterator[dict]:
-    """
-    Download YouTube video directly — no strategy rotation overhead.
-    Uses __SEP__ progress template for clean progress parsing.
-    """
     if selected_fid is not None:
         format_id = selected_fid
 
@@ -243,10 +236,10 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
         fmt = f"{format_id}/bestaudio/best" if format_id else "bestaudio/best"
         extra = [
             "--extract-audio", "--audio-format", "mp3", "--audio-quality", "320K",
-            "--embed-thumbnail",       # embed thumbnail as album art
-            "--add-metadata",          # write title/artist/album metadata
-            "--convert-thumbnails", "jpg",  # ensure thumbnail is compatible
-            "--postprocessor-args", "ffmpeg:-id3v2_version 3",  # fix ID3 tags for Windows
+            "--embed-thumbnail",
+            "--add-metadata",
+            "--convert-thumbnails", "jpg",
+            "--postprocessor-args", "ffmpeg:-id3v2_version 3",
         ]
     else:
         fmt = (f"{format_id}+bestaudio/bestvideo+bestaudio/best"
@@ -276,10 +269,8 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
 
     dl_attempts = [
         ("tv_embedded", False),
-        ("tv_embedded", True),
         ("web",         False),
-        ("web",         True),
-        ("android",     False),
+        ("tv_embedded", True),
     ]
 
     for client, use_cookies in dl_attempts:
@@ -322,10 +313,8 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
             return
 
         err = "\n".join(err_lines).strip()
-        # 403 or bot check — try next client silently
         if any(s in err.lower() for s in ("403", "forbidden", "sign in", "bot")):
             if got_progress:
-                # Already started downloading — don't retry, just report error
                 yield {"type": "error", "message": err[:200]}
                 return
             yield {"type": "progress", "percent": 0.0, "speed": f"retrying ({client})...", "eta": ""}
@@ -337,6 +326,5 @@ def download_video(url: str, format_id=None, out_dir: str = "downloads",
     yield {"type": "error", "message": "Download failed after all attempts"}
 
 
-# Aliases
 fetcher_download = download_video
 download = download_video
