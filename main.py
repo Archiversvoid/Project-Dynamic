@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QStackedWidget, 
                              QScrollArea, QFrame, QLineEdit, QProgressBar, 
                              QSpacerItem, QSizePolicy, QComboBox, QGraphicsDropShadowEffect,
-                             QSystemTrayIcon, QStyle)
+                             QSystemTrayIcon, QStyle, QGraphicsOpacityEffect)
 from PySide6.QtCore import (Qt, QThread, Signal, QSize, QObject, 
                           QTimer, QUrl, QVariantAnimation, QPropertyAnimation, QEasingCurve,
                           QPoint, QParallelAnimationGroup, QSequentialAnimationGroup)
@@ -172,6 +172,10 @@ def fetcher_download(url, selected_fid=None, out_dir=None, is_audio=False, start
                     'ffmpeg': ['-avoid_negative_ts', 'make_zero']
                 }
             }
+
+            if _is_youtube_url(url):
+                ydl_opts['extractor_args'] = {'youtube': ['player_client=tv,web_safari']}
+                ydl_opts['http_headers'] = {'Accept-Language': 'en-US,en;q=0.9'}
 
             if is_audio:
                 ydl_opts['format'] = 'bestaudio/best'
@@ -367,6 +371,29 @@ class ModernScrollArea(QScrollArea):
         else:
             super().wheelEvent(event)
 
+class SkeletonBox(QFrame):
+    """A pulsing placeholder block used while real content is still loading."""
+    def __init__(self, width=None, height=12, radius=6, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(height)
+        if width is not None:
+            self.setFixedWidth(width)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(f"background-color: {CARD_INNER_BG}; border-radius: {radius}px; border: none;")
+        effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(950)
+        anim.setStartValue(0.35)
+        anim.setKeyValueAt(0.5, 0.9)
+        anim.setEndValue(0.35)
+        anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+        anim.setLoopCount(-1)
+        anim.start()
+        self._anim = anim
+
+
 class FilterTab(QFrame):
     clicked = Signal(str)
     def __init__(self, name, count, is_active=False, parent=None):
@@ -519,6 +546,7 @@ class DynamicPC(QMainWindow):
         app_font.setStyleHint(QFont.StyleHint.SansSerif)
         QApplication.setFont(app_font)
         self._dl_items, self._dl_cards, self._dl_tab_filter, self._last_url = [], {}, "All", ""
+        self._dl_list_dirty, self._dl_first_build_done = True, False
         self._load_icons()
         self._setup_tray_icon()
         self._load_downloads()
@@ -648,7 +676,7 @@ class DynamicPC(QMainWindow):
         self.stack.setCurrentIndex(idx)
         for i, btn in enumerate(self.nav_btns):
             btn.setStyleSheet(f"QPushButton {{ text-align: left; padding: 10px; border-radius: 10px; background-color: transparent; color: {TEXT_MAIN if i == idx else TEXT_MUTED}; font-size: 16px; font-weight: 500; }} QPushButton:hover {{ background-color: #222222; }}")
-        if idx == 2: self._refresh_dl_list()
+        if idx == 2: self._ensure_dl_list_loaded()
 
     def _build_home_tab(self):
         layout = QVBoxLayout(self.tab_home)
@@ -812,84 +840,181 @@ class DynamicPC(QMainWindow):
         if not audio_q: audio_q = [f"MP3 {br}kbps" for br in (320, 256, 192, 128, 96, 64)]
         site = _site_name(url)
 
+        # Transparent container wrapping everything centrally for the new vertical layout
         outer = QFrame()
-        outer.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border: none; border-radius: 12px; }}")
-        o_layout = QVBoxLayout(outer); o_layout.setContentsMargins(30, 30, 30, 30); o_layout.setSpacing(25)
+        outer.setStyleSheet("QFrame { border: none; }")
+        outer.setMaximumWidth(760)
+        
+        o_layout = QVBoxLayout(outer)
+        o_layout.setContentsMargins(0, 0, 0, 0)
+        o_layout.setSpacing(18)
 
-        hdr_layout = QHBoxLayout(); hdr_layout.setContentsMargins(0, 0, 0, 0); hdr_layout.setSpacing(30)
+        # Large Thumbnail
         thumb_lbl = QLabel()
-        thumb_lbl.setFixedSize(320, 180)
+        thumb_lbl.setFixedSize(760, 428) 
         thumb_lbl.setStyleSheet(f"background-color: {CARD_INNER_BG}; border-radius: 8px;")
         if thumb_path and os.path.exists(thumb_path):
-            pix = QPixmap(thumb_path).scaled(320, 180, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            pix = QPixmap(thumb_path).scaled(760, 428, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
             thumb_lbl.setPixmap(get_rounded_pixmap(pix, 8))
-        hdr_layout.addWidget(thumb_lbl)
+        o_layout.addWidget(thumb_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        meta_layout = QVBoxLayout(); meta_layout.setContentsMargins(0, 0, 0, 0); meta_layout.setSpacing(12)
-        t_lbl = QLabel(title_text); t_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 30px; font-weight: bold; border: none;"); t_lbl.setWordWrap(True)
-        c_lbl = QLabel(channel_text); c_lbl.setStyleSheet(f"color: #DDDDDD; font-size: 18px; border: none;")
-        meta_layout.addWidget(t_lbl); meta_layout.addWidget(c_lbl)
+        # Title Label
+        t_lbl = QLabel(title_text)
+        t_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 34px; font-weight: normal; border: none;")
+        t_lbl.setWordWrap(True)
+        o_layout.addWidget(t_lbl)
+
+        # Metadata Row (Channel, Duration, Site icon & name)
+        meta_layout = QHBoxLayout()
+        meta_layout.setSpacing(15)
         
-        dur_site_layout = QHBoxLayout(); dur_site_layout.setSpacing(10)
-        d_lbl = QLabel(dur_str); d_lbl.setStyleSheet(f"color: {'#FF5555' if is_live else TEXT_MAIN}; font-size: 16px; font-weight: {'bold' if is_live else 'normal'}; border: none;")
-        dot_lbl = QLabel(" • "); dot_lbl.setStyleSheet(f"color: #DDDDDD; font-size: 16px; border: none;")
-        dur_site_layout.addWidget(d_lbl); dur_site_layout.addWidget(dot_lbl)
+        c_lbl = QLabel(channel_text)
+        c_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 16px; border: none;")
+        meta_layout.addWidget(c_lbl)
+
+        d_lbl = QLabel(dur_str)
+        d_lbl.setStyleSheet(f"color: {'#FF5555' if is_live else TEXT_MAIN}; font-size: 16px; font-weight: {'bold' if is_live else 'normal'}; border: none;")
+        meta_layout.addWidget(d_lbl)
         
+        site_layout = QHBoxLayout()
+        site_layout.setSpacing(6)
         if fav_path and os.path.exists(fav_path):
-            fav_lbl = QLabel(); fav_lbl.setStyleSheet("border: none; background: transparent;")
+            fav_lbl = QLabel()
+            fav_lbl.setStyleSheet("border: none; background: transparent;")
             fav_lbl.setPixmap(QPixmap(fav_path).scaled(18, 18, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            dur_site_layout.addWidget(fav_lbl)
+            site_layout.addWidget(fav_lbl)
         else:
             site_icon = QLabel("▶" if "Youtube" in site else "🌐")
             site_icon.setStyleSheet(f"color: {'#FF0000' if 'Youtube' in site else TEAL_ACCENT}; font-size: 18px; border: none;")
-            dur_site_layout.addWidget(site_icon)
+            site_layout.addWidget(site_icon)
             
-        site_lbl = QLabel(site); site_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        site_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 16px; font-weight: bold; border: none;")
+        site_lbl = QLabel(site)
+        site_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        site_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 16px; border: none;")
         site_lbl.mousePressEvent = lambda e: self._open_qurl(QUrl(url))
-        dur_site_layout.addWidget(site_lbl); dur_site_layout.addStretch()
-        meta_layout.addLayout(dur_site_layout); meta_layout.addStretch()
-        hdr_layout.addLayout(meta_layout); hdr_layout.addStretch(); o_layout.addLayout(hdr_layout)
+        
+        site_layout.addWidget(site_lbl)
+        meta_layout.addLayout(site_layout)
+        meta_layout.addStretch()
+        
+        o_layout.addLayout(meta_layout)
+        o_layout.addSpacing(5)
 
-        seg_frame = QFrame(); seg_frame.setStyleSheet("QFrame { background-color: #222222; border-radius: 12px; }")
-        seg_frame.setFixedHeight(48); seg_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        seg_layout = QHBoxLayout(seg_frame); seg_layout.setContentsMargins(4, 4, 4, 4); seg_layout.setSpacing(4)
-        bv = QPushButton("Video"); bv.setFixedHeight(40); bv.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        ba = QPushButton("Audio"); ba.setFixedHeight(40); ba.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        # Bottom Controls Row
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(15)
+
+        # Segmented Video / Audio Controller
+        seg_frame = QFrame()
+        seg_frame.setStyleSheet("QFrame { background-color: #222222; border-radius: 8px; }")
+        seg_frame.setFixedHeight(38)
+        seg_layout = QHBoxLayout(seg_frame)
+        seg_layout.setContentsMargins(4, 4, 4, 4)
+        seg_layout.setSpacing(2)
+        
+        bv = QPushButton("Video")
+        bv.setFixedHeight(30)
+        bv.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        
+        ba = QPushButton("Audio")
+        ba.setFixedHeight(30)
+        ba.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         
         def update_btn_styles(mode):
-            act = f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 18px; font-weight: bold; border-radius: 8px; border: none; }}"
-            inact = f"QPushButton {{ background-color: transparent; color: {TEXT_MUTED}; font-size: 18px; font-weight: bold; border-radius: 8px; border: none; }} QPushButton:hover {{ background-color: #2A2A2A; }}"
+            act = f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }}"
+            inact = f"QPushButton {{ background-color: transparent; color: {TEXT_MUTED}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }} QPushButton:hover {{ background-color: #2A2A2A; }}"
             if mode == "Video": bv.setStyleSheet(act); ba.setStyleSheet(inact)
             else: bv.setStyleSheet(inact); ba.setStyleSheet(act)
         
         if audio_only:
-            bv.setDisabled(True); bv.setStyleSheet("QPushButton { background-color: transparent; color: #444; font-size: 18px; font-weight: bold; border-radius: 8px; border: none; }")
-            ba.setStyleSheet(f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 18px; font-weight: bold; border-radius: 8px; border: none; }}")
+            bv.setDisabled(True)
+            bv.setStyleSheet("QPushButton { background-color: transparent; color: #444; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }")
+            ba.setStyleSheet(f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }}")
         else: update_btn_styles("Video")
-        seg_layout.addWidget(bv); seg_layout.addWidget(ba); o_layout.addWidget(seg_frame)
+        
+        seg_layout.addWidget(bv)
+        seg_layout.addWidget(ba)
+        btn_layout.addWidget(seg_frame)
 
-        qual_layout = QVBoxLayout(); qual_layout.setSpacing(8)
-        ql = QLabel("Quality" if not audio_only else "Bitrate"); ql.setStyleSheet("color: #DDDDDD; font-size: 16px; border: none;")
-        qm = QComboBox(); qm.setFixedHeight(48); qm.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        qm.setStyleSheet(f"QComboBox {{ background-color: #181818; color: {TEAL_ACCENT}; font-size: 15px; border-radius: 8px; padding: 10px 15px; border: 1px solid #333333; }} QComboBox:focus {{ border: 2px solid #0078D4; }} QComboBox::drop-down {{ border: none; width: 30px; }} QComboBox QAbstractItemView {{ background-color: #202020; color: {TEXT_MAIN}; selection-background-color: #383838; border: 1px solid #333333; border-radius: 6px; outline: none; }}")
+        # Quality Combobox
+        qm = QComboBox()
+        qm.setFixedHeight(38)
+        qm.setMinimumWidth(160)
+        qm.setStyleSheet("""
+            QComboBox { 
+                background-color: #1A1A1A; 
+                color: #FFFFFF; 
+                font-size: 14px; 
+                border-radius: 6px; 
+                padding: 5px 12px; 
+                border: 1px solid #2A2A2A; 
+            }
+            QComboBox::drop-down { 
+                border: none; 
+                width: 25px; 
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #FFFFFF;
+                width: 0px;
+                height: 0px;
+                margin-right: 8px;
+            }
+            QComboBox QAbstractItemView { 
+                background-color: #181818; 
+                color: #FFFFFF; 
+                selection-background-color: #B5B5B5; 
+                selection-color: #000000; 
+                border: 1px solid #FFFFFF; 
+                border-radius: 4px; 
+                outline: none; 
+                padding: 2px 0px;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 26px;
+                padding-left: 10px;
+                color: #FFFFFF;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #B5B5B5;
+                color: #000000;
+            }
+        """)
         qm.addItems(audio_q if audio_only else (video_q or ["Best quality"]))
-        qual_layout.addWidget(ql); qual_layout.addWidget(qm); o_layout.addLayout(qual_layout)
+        btn_layout.addWidget(qm)
 
-        btn_layout = QHBoxLayout(); btn_layout.setSpacing(20)
-        btn_cancel = QPushButton("Cancel"); btn_cancel.setFixedHeight(48); btn_cancel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed); btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        btn_cancel.setStyleSheet(f"QPushButton {{ background-color: transparent; border: 1px solid {TEAL_ACCENT}; color: {TEXT_MAIN}; font-size: 16px; font-weight: bold; border-radius: 24px; }} QPushButton:hover {{ background-color: #222222; }}")
-        btn_dl = QPushButton("Download"); btn_dl.setFixedHeight(48); btn_dl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed); btn_dl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        if is_live: btn_dl.setStyleSheet("QPushButton { background-color: #222222; color: #666666; font-size: 16px; font-weight: bold; border-radius: 24px; border: 1px solid #333333; } QPushButton:hover { background-color: #262626; }")
-        else: btn_dl.setStyleSheet(f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #000000; font-size: 16px; font-weight: bold; border-radius: 24px; border: none; }} QPushButton:hover {{ background-color: #00A892; }}")
-        btn_layout.addWidget(btn_cancel); btn_layout.addWidget(btn_dl); o_layout.addLayout(btn_layout)
+        btn_layout.addStretch()
+
+        # Cancel Button
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setFixedHeight(38)
+        btn_cancel.setMinimumWidth(100)
+        btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_cancel.setStyleSheet(f"QPushButton {{ background-color: transparent; border: 1px solid #777777; color: {TEXT_MAIN}; font-size: 14px; border-radius: 19px; }} QPushButton:hover {{ background-color: #222222; }}")
+        btn_layout.addWidget(btn_cancel)
+
+        # Download Button
+        btn_dl = QPushButton("Download")
+        btn_dl.setFixedHeight(38)
+        btn_dl.setMinimumWidth(120)
+        btn_dl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if is_live: 
+            btn_dl.setStyleSheet("QPushButton { background-color: #222222; color: #666666; font-size: 14px; font-weight: bold; border-radius: 19px; border: 1px solid #333333; } QPushButton:hover { background-color: #262626; }")
+        else: 
+            btn_dl.setStyleSheet(f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #000000; font-size: 14px; font-weight: bold; border-radius: 19px; border: none; }} QPushButton:hover {{ background-color: #00A892; }}")
+        btn_layout.addWidget(btn_dl)
+
+        o_layout.addLayout(btn_layout)
 
         current_mode = ["Audio" if audio_only else "Video"]
         def set_mode(mode):
             if audio_only and mode == "Video": return
             current_mode[0] = mode; qm.clear()
-            if mode == "Video": update_btn_styles("Video"); ql.setText("Quality"); qm.addItems(video_q or ["Best quality"])
-            else: update_btn_styles("Audio"); ql.setText("Bitrate"); qm.addItems(audio_q or ["Best Audio"])
+            if mode == "Video": update_btn_styles("Video"); qm.addItems(video_q or ["Best quality"])
+            else: update_btn_styles("Audio"); qm.addItems(audio_q or ["Best Audio"])
+            
         bv.clicked.connect(lambda: set_mode("Video"))
         ba.clicked.connect(lambda: set_mode("Audio"))
 
@@ -905,10 +1030,77 @@ class DynamicPC(QMainWindow):
                 site_name=site, thumb_url=thumb_url, fav_path=fav_path
             )
             self._dl_items.append(item)
+            self._dl_item_added(item)
             self._start_download(item); self._show_tab(2); _cancel()
             
         btn_dl.clicked.connect(_on_download)
-        self.home_slot_layout.addWidget(outer, alignment=Qt.AlignmentFlag.AlignTop)
+        
+        self.home_slot_layout.addWidget(outer, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+
+    def _ensure_dl_list_loaded(self):
+        """Called whenever the Downloads tab becomes visible. The full card
+        list is only ever built once (behind a skeleton on the very first
+        visit) - after that, items are patched in/out individually, so
+        opening the tab again never re-does that work."""
+        if not self._dl_list_dirty:
+            return
+        if not self._dl_first_build_done:
+            self._dl_first_build_done = True
+            self._show_dl_skeleton()
+            QTimer.singleShot(30, self._full_rebuild_dl_cards)
+        else:
+            self._full_rebuild_dl_cards()
+
+    def _show_dl_skeleton(self):
+        while self.scroll_layout.count():
+            it = self.scroll_layout.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        skeleton_count = min(max(len(self._dl_items), 1), 5)
+        for _ in range(skeleton_count):
+            self.scroll_layout.addWidget(self._build_skeleton_card())
+        self.scroll_layout.addStretch()
+
+    def _build_skeleton_card(self):
+        # Wrapper bakes its own bottom margin so cards always read as
+        # separate, evenly-spaced tiles - never relies on layout spacing alone.
+        wrapper = QWidget()
+        wrap_v = QVBoxLayout(wrapper); wrap_v.setContentsMargins(0, 0, 0, 14); wrap_v.setSpacing(0)
+
+        card = QFrame(); card.setFixedHeight(180)
+        card.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border: 1px solid #333333; border-radius: 14px; }}")
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(24); shadow.setColor(QColor(0, 0, 0, 130)); shadow.setOffset(0, 6)
+        card.setGraphicsEffect(shadow)
+
+        main_h = QHBoxLayout(card); main_h.setContentsMargins(16, 16, 16, 16); main_h.setSpacing(20)
+        main_h.addWidget(SkeletonBox(240, 135, radius=8))
+
+        right_v = QVBoxLayout(); right_v.setContentsMargins(0, 6, 0, 6); right_v.setSpacing(14)
+        right_v.addWidget(SkeletonBox(None, 22, radius=4))
+        meta_row = QHBoxLayout(); meta_row.setSpacing(10)
+        meta_row.addWidget(SkeletonBox(90, 13, radius=4))
+        meta_row.addWidget(SkeletonBox(60, 13, radius=4))
+        meta_row.addWidget(SkeletonBox(70, 13, radius=4))
+        meta_row.addStretch()
+        right_v.addLayout(meta_row)
+        right_v.addStretch()
+
+        ctrl_row = QHBoxLayout(); ctrl_row.setSpacing(12)
+        ctrl_row.addWidget(SkeletonBox(36, 36, radius=18))
+        bar_col = QVBoxLayout(); bar_col.setSpacing(8)
+        bar_col.addWidget(SkeletonBox(None, 4, radius=2))
+        stats_row = QHBoxLayout()
+        stats_row.addWidget(SkeletonBox(160, 12, radius=4))
+        stats_row.addStretch()
+        stats_row.addWidget(SkeletonBox(90, 12, radius=4))
+        bar_col.addLayout(stats_row)
+        ctrl_row.addLayout(bar_col)
+        right_v.addLayout(ctrl_row)
+
+        main_h.addLayout(right_v)
+        wrap_v.addWidget(card)
+        return wrapper
 
     def _build_downloads_tab(self):
         main_layout = QVBoxLayout(self.tab_dl); main_layout.setContentsMargins(0, 0, 0, 0); main_layout.setSpacing(0)
@@ -921,27 +1113,66 @@ class DynamicPC(QMainWindow):
         self.scroll = ModernScrollArea(); self.scroll_content = QWidget(); self.scroll_content.setStyleSheet("background-color: transparent;")
         self.scroll_layout = QVBoxLayout(self.scroll_content); self.scroll_layout.setContentsMargins(32, 10, 32, 16); self.scroll_layout.setSpacing(16); self.scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll.setWidget(self.scroll_content); main_layout.addWidget(self.scroll, 1)
+        self._dl_empty_label = None
 
     def _on_filter_changed(self, f_name):
         if self._dl_tab_filter == f_name: return
-        self._dl_tab_filter = f_name; self._refresh_dl_list()
+        self._dl_tab_filter = f_name
+        self._sync_dl_filter_view()
 
-    def _refresh_dl_list(self):
+    def _full_rebuild_dl_cards(self):
+        """The only expensive path - builds every card from scratch. Only
+        ever runs once (first visit); everything after this patches
+        individual cards in/out instead of rebuilding the whole list."""
+        while self.scroll_layout.count():
+            it = self.scroll_layout.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        self._dl_cards = {}
+        for item in reversed(self._dl_items):
+            self.scroll_layout.addWidget(self._build_dl_card_widget(item))
+        self._dl_empty_label = QLabel("No downloads here")
+        self._dl_empty_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 15px;")
+        self._dl_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll_layout.addWidget(self._dl_empty_label)
+        self.scroll_layout.addStretch()
+        self._dl_list_dirty = False
+        self._sync_dl_filter_view()
+
+    def _sync_dl_filter_view(self):
+        """Cheap: just toggles visibility of already-built cards to match
+        the active filter tab, and refreshes counts. Never rebuilds
+        anything, so switching filter tags never freezes."""
         counts = {"All": len(self._dl_items), "Active": sum(1 for d in self._dl_items if d.status=="active"), "Paused": sum(1 for d in self._dl_items if d.status=="paused"), "Done": sum(1 for d in self._dl_items if d.status=="done"), "Failed": sum(1 for d in self._dl_items if d.status=="failed")}
         self.filter_tab_bar.update_counts(counts)
-        while self.scroll_layout.count():
-            item = self.scroll_layout.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        filtered = [d for d in reversed(self._dl_items) if self._dl_tab_filter=="All" or d.status==self._dl_tab_filter.lower()]
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded if len(filtered) >= 3 else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        for item in filtered: self.scroll_layout.addWidget(self._build_dl_card_widget(item))
-        if not filtered:
-            empty = QLabel("No downloads here")
-            empty.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 15px;"); empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.scroll_layout.addWidget(empty)
-        self.scroll_layout.addStretch()
+        visible = 0
+        for item in self._dl_items:
+            card = self._dl_cards.get(item.id)
+            if not card: continue
+            match = self._dl_tab_filter == "All" or item.status == self._dl_tab_filter.lower()
+            if card.isVisible() != match: card.setVisible(match)
+            if match: visible += 1
+        if self._dl_empty_label is not None:
+            self._dl_empty_label.setVisible(visible == 0)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded if visible >= 3 else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _dl_item_added(self, item):
+        """Call right after appending to self._dl_items. If the list has
+        never been built yet, does nothing - the eventual first build will
+        already include it. Otherwise patches just the one new card in."""
+        if not self._dl_first_build_done: return
+        self.scroll_layout.insertWidget(0, self._build_dl_card_widget(item))
+        self._sync_dl_filter_view()
+
+    def _dl_item_removed(self, item):
+        if not self._dl_first_build_done: return
+        card = self._dl_cards.pop(item.id, None)
+        if card:
+            self.scroll_layout.removeWidget(card)
+            card.deleteLater()
+        self._sync_dl_filter_view()
 
     def _build_dl_card_widget(self, item: DownloadItem):
+
         card = QFrame(); card.setFixedHeight(180)
         card.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border: 1px solid #2A2A2A; border-radius: 14px; }}")
         main_h = QHBoxLayout(card); main_h.setContentsMargins(16, 16, 16, 16); main_h.setSpacing(20)
@@ -961,7 +1192,7 @@ class DynamicPC(QMainWindow):
         def _trash_click():
             if item._trash_ready:
                 if item in self._dl_items: self._dl_items.remove(item)
-                item._cancelled = True; self._refresh_dl_list()
+                item._cancelled = True; self._dl_item_removed(item)
             else:
                 item._trash_ready = True; trash_btn.setIcon(self._icons.get("trash red", QIcon()))
                 QTimer.singleShot(3000, lambda: _reset_trash())
@@ -1053,11 +1284,23 @@ class DynamicPC(QMainWindow):
             self.tray_icon.showMessage("Download finished", raw_title, QSystemTrayIcon.MessageIcon.Information, 5000)
 
     def _refresh_single_card(self, item):
-        try:
-            if item.id in self._dl_cards:
-                card = self._dl_cards.pop(item.id); card.deleteLater()
-        except RuntimeError: pass
-        self._refresh_dl_list()
+        """Rebuild just this item's card in place (its layout differs by
+        status - failed shows a retry button, active shows a progress bar,
+        etc.) without touching any other card."""
+        if not self._dl_first_build_done:
+            return
+        old = self._dl_cards.pop(item.id, None)
+        idx = -1
+        if old is not None:
+            try:
+                idx = self.scroll_layout.indexOf(old)
+                self.scroll_layout.removeWidget(old)
+                old.deleteLater()
+            except RuntimeError:
+                idx = -1
+        new_card = self._build_dl_card_widget(item)
+        self.scroll_layout.insertWidget(idx if idx >= 0 else 0, new_card)
+        self._sync_dl_filter_view()
         if item.status == "done" and not getattr(item, "_notified", False):
             item._notified = True; self._show_download_notification(item)
 
