@@ -16,7 +16,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtCore import (Qt, QUrl, Signal, QPointF, QRectF, QLineF, QObject, QTimer, 
                           QPropertyAnimation, QSequentialAnimationGroup, QParallelAnimationGroup, 
-                          QPoint, QEasingCurve)
+                          QPoint, QEasingCurve, QEvent)
 from PySide6.QtGui import QFont, QPainter, QColor, QPen, QCursor, QPixmap, QIcon, QDesktopServices
 
 try:
@@ -28,6 +28,9 @@ except ImportError:
 
 try:
     import yt_dlp
+    import builtins
+    # Inject yt_dlp globally so the DownloadWorker in main.py can access it for range functions
+    builtins.yt_dlp = yt_dlp
 except ImportError:
     yt_dlp = None
 
@@ -61,6 +64,62 @@ _AUDIO_ONLY_DOMAINS = (
 
 def _is_audio_only_url(url):
     return any(domain in url.lower() for domain in _AUDIO_ONLY_DOMAINS)
+
+
+class AnimatedComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup = None
+        self._anim_group = None
+
+    def showPopup(self):
+        super().showPopup()
+        popup = self.view().window()
+        if popup and popup is not self._popup:
+            self._popup = popup
+            popup.installEventFilter(self)
+        if popup:
+            popup.setWindowOpacity(0.0)
+            QTimer.singleShot(0, self._animate_popup)
+
+    def eventFilter(self, obj, event):
+        if obj is self._popup and event.type() == QEvent.Type.Show:
+            obj.setWindowOpacity(0.0)
+        return super().eventFilter(obj, event)
+
+    def _animate_popup(self):
+        popup = self._popup
+        if not popup:
+            return
+
+        if self._anim_group and self._anim_group.state() == QParallelAnimationGroup.State.Running:
+            self._anim_group.stop()
+
+        self._anim_group = QParallelAnimationGroup(self)
+
+        fade_anim = QPropertyAnimation(popup, b"windowOpacity")
+        fade_anim.setDuration(200)
+        fade_anim.setStartValue(0.0)
+        fade_anim.setEndValue(1.0)
+        fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        slide_anim = QPropertyAnimation(popup, b"pos")
+        slide_anim.setDuration(200)
+
+        target_pos = popup.pos()
+        global_pos = self.mapToGlobal(QPoint(0, self.height()))
+
+        if target_pos.y() < global_pos.y() - 10:
+            slide_anim.setStartValue(target_pos + QPoint(0, 8))
+        else:
+            slide_anim.setStartValue(target_pos + QPoint(0, -8))
+
+        slide_anim.setEndValue(target_pos)
+        slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self._anim_group.addAnimation(fade_anim)
+        self._anim_group.addAnimation(slide_anim)
+        self._anim_group.start()
 
 
 def _site_name(url):
@@ -227,7 +286,7 @@ class LoadingOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setStyleSheet("background-color: rgba(0, 0, 0, 160); border-radius: 12px;")
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 160); border-radius: 12px")
         
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -368,7 +427,7 @@ class AspectRatioLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pix = None
-        self.setStyleSheet("background-color: #000000; border-radius: 12px;")
+        self.setStyleSheet("background-color: #000000;")
         
     def setPixmap(self, p):
         self.pix = p
@@ -387,7 +446,7 @@ class AspectRatioLabel(QLabel):
 
 class TrimRangeSlider(QWidget):
     positionChanged = Signal(float)
-    seekRequested = Signal(float)  # Emitted only when dragging finishes
+    seekRequested = Signal(float)
     trimRangeChanged = Signal(float, float)
 
     def __init__(self, parent=None):
@@ -658,7 +717,7 @@ class TrimLoadTab(QWidget):
         ed_layout.setSpacing(10)
 
         self.video_frame = QFrame()
-        self.video_frame.setStyleSheet("background-color: #000000; border-radius: 12px;")
+        self.video_frame.setStyleSheet("background-color: #000000;")
         vf_layout = QVBoxLayout(self.video_frame)
         vf_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -672,7 +731,7 @@ class TrimLoadTab(QWidget):
         self.thumbnail_label.hide()
         
         self.preview_error_lbl = QLabel("Couldn't load preview", self.video_frame)
-        self.preview_error_lbl.setStyleSheet("color: #FFFFFF; font-size: 16px; font-weight: bold; background-color: rgba(0, 0, 0, 180); border-radius: 8px; padding: 12px 24px;")
+        self.preview_error_lbl.setStyleSheet("color: #FFFFFF; font-size: 16px; font-weight: bold; background-color: rgba(0, 0, 0, 180); padding: 12px 24px;")
         self.preview_error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_error_lbl.hide()
 
@@ -730,7 +789,7 @@ class TrimLoadTab(QWidget):
 
         timeline_frame = QFrame()
         timeline_frame.setFixedHeight(54)
-        timeline_frame.setStyleSheet("background-color: #1A1A1A; border-radius: 8px;")
+        timeline_frame.setStyleSheet("background-color: #1A1A1A;")
         tl_layout = QHBoxLayout(timeline_frame)
         tl_layout.setContentsMargins(8, 0, 12, 0)
         tl_layout.setSpacing(6)
@@ -761,14 +820,15 @@ class TrimLoadTab(QWidget):
         ed_layout.addWidget(timeline_frame)
 
         dock_frame = QFrame()
-        dock_frame.setFixedHeight(76)
-        dock_frame.setStyleSheet("QFrame { background-color: #1A1A1A; border-radius: 12px; }")
+        dock_frame.setFixedHeight(96) # Raised from 76 to fit two clean rows
+        dock_frame.setStyleSheet("QFrame { background-color: #1A1A1A; }")
         
         grid = QGridLayout(dock_frame)
         grid.setContentsMargins(16, 12, 16, 12)
         grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(4)
+        grid.setVerticalSpacing(8) # Raised slightly for row separation
 
+        # --- ROW 0 & 1: TIME CONTROLS (Left Side) ---
         lbl_start = QLabel("Start")
         lbl_start.setStyleSheet("color: #FFFFFF; font-size: 13px;")
         grid.addWidget(lbl_start, 0, 0)
@@ -789,6 +849,7 @@ class TrimLoadTab(QWidget):
 
         grid.setColumnMinimumWidth(2, 24)
 
+        # --- ROW 0: SETTINGS CONTROLS (Shifted Higher) ---
         mode_frame = QFrame()
         mode_frame.setFixedSize(130, 28)
         mode_frame.setStyleSheet("QFrame { background-color: #252525; border: 1px solid #333333; border-radius: 6px; }")
@@ -807,22 +868,44 @@ class TrimLoadTab(QWidget):
         m_layout.addWidget(self.btn_mode_vid)
         m_layout.addWidget(self.btn_mode_aud)
         
-        grid.addWidget(mode_frame, 1, 3)
+        # MOVED TO ROW 0
+        grid.addWidget(mode_frame, 0, 3)
 
-        grid.setColumnMinimumWidth(4, 16)
-
-        self.qual_combo = QComboBox()
+        self.qual_combo = AnimatedComboBox()
         self.qual_combo.setFixedSize(90, 28)
-        self.qual_combo.setStyleSheet(f"QComboBox {{ background-color: #252525; color: {TEAL_ACCENT}; border: 1px solid #333333; border-radius: 6px; padding: 0 10px; font-weight: 400; font-size: 13px; }} QComboBox::drop-down {{ border: none; }} QComboBox QAbstractItemView {{ background: #202020; color: #FFF; }}")
+        self.qual_combo.setStyleSheet("""
+            QComboBox { 
+                background-color: #1A1A1A; 
+                color: #FFFFFF; 
+                font-size: 12px; 
+                border-radius: 6px; 
+                padding: 0 10px; 
+                border: 1px solid #2A2A2A; 
+            }
+            QComboBox::drop-down { border: none; width: 0px; }
+            QComboBox::down-arrow { image: none; border: none; }
+            QComboBox QAbstractItemView { 
+                background-color: #181818; color: #FFFFFF; 
+                selection-background-color: #B5B5B5; selection-color: #000000; 
+                border: 1px solid #FFFFFF; border-radius: 4px; outline: none; padding: 2px 0px;
+            }
+            QComboBox QAbstractItemView::item { min-height: 26px; padding-left: 10px; color: #FFFFFF; }
+            QComboBox QAbstractItemView::item:selected { background-color: #B5B5B5; color: #000000; }
+        """)
         self.qual_combo.currentIndexChanged.connect(self._update_est_size)
-        grid.addWidget(self.qual_combo, 1, 5)
+        
+        # MOVED TO ROW 0
+        grid.addWidget(self.qual_combo, 0, 4)
 
         self.est_size_lbl = QLabel("Est. size ~0 MB")
         self.est_size_lbl.setStyleSheet("color: #EEEEEE; font-size: 13px;")
-        grid.addWidget(self.est_size_lbl, 1, 6)
+        
+        # MOVED TO ROW 0
+        grid.addWidget(self.est_size_lbl, 0, 5)
 
+        # --- ROW 1: ACTION BUTTONS (Shifted Lower Right) ---
         spacer = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        grid.addItem(spacer, 1, 7)
+        grid.addItem(spacer, 1, 3)
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
@@ -841,27 +924,38 @@ class TrimLoadTab(QWidget):
         self.btn_download.clicked.connect(self._on_download)
         btn_layout.addWidget(self.btn_download)
 
-        grid.addLayout(btn_layout, 1, 8)
+        # MOVED TO ROW 1, SPANNING THE LOWER RIGHT COLUMNS
+        grid.addLayout(btn_layout, 1, 4, 1, 3)
+
 
         ed_layout.addWidget(dock_frame)
         self.layout.addWidget(self.editor_container)
 
     def _show_initial_view(self):
-        self.player.stop()
-        self.loading_overlay.stop()
+        # Safely release the network stream immediately to prevent Qt from freezing the main thread during reset
+        if hasattr(self, 'player'):
+            self.player.pause()
+            self.player.setSource(QUrl())
+            self.player.stop()
+            
+        if hasattr(self, 'loading_overlay'):
+            self.loading_overlay.stop()
         
         self.preview_failed = False
         if hasattr(self, 'preview_error_lbl'):
             self.preview_error_lbl.hide()
             
-        self.btn_play.setIcon(self.icon_play)
-        self.editor_container.hide()
-        self.search_container.show()
-        self.title_lbl.show()
-        self.url_entry.show()
-        self.url_entry.clear()
-        self._reset_inputs_style()
-        self._clear_processing_slot()
+        if hasattr(self, 'btn_play') and hasattr(self, 'icon_play'):
+            self.btn_play.setIcon(self.icon_play)
+            
+        if hasattr(self, 'editor_container'):
+            self.editor_container.hide()
+            self.search_container.show()
+            self.title_lbl.show()
+            self.url_entry.show()
+            self.url_entry.clear()
+            self._reset_inputs_style()
+            self._clear_processing_slot()
 
     def _clear_processing_slot(self):
         while self.proc_layout.count():
@@ -1265,16 +1359,21 @@ class TrimLoadTab(QWidget):
             selected_fid=selected_fid,
             duration_str=format_time_str(e - s),
             site_name=_site_name(url),
+            thumb_url=thumb_url,
+            fav_path=self.current_info.get('_fav_path'),
             start_time=s,
             end_time=e
         )
         
         self.main_win._dl_items.append(item)
-        if hasattr(self.main_win, "_dl_data_changed"):
-            self.main_win._dl_data_changed()
+        if hasattr(self.main_win, "_dl_item_added"):
+            self.main_win._dl_item_added(item)
+            
         self.main_win._start_download(item)
         self.main_win._show_tab(2)
-        self._show_initial_view()
+        
+        # Defer the UI reset logic to safely prevent GUI hangs during the tab switch 
+        QTimer.singleShot(50, self._show_initial_view)
 
 
 if __name__ == "__main__":
