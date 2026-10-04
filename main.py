@@ -218,11 +218,14 @@ def fetcher_download(url, selected_fid=None, out_dir=None, is_audio=False, start
                 def range_func(info_dict, ydl):
                     return [{'start_time': start_time, 'end_time': end_time}]
                 ydl_opts['download_ranges'] = range_func
+                # force_keyframes_at_cuts already gets accurate cuts cheaply:
+                # yt-dlp re-encodes only the small slice right at each cut
+                # point and stream-copies everything else. Forcing a full
+                # '-c:v libx264' re-encode of the whole segment on top of
+                # that (as this used to) throws that efficiency away and
+                # makes ffmpeg software-encode the entire clip - that was
+                # the actual source of the high CPU usage during trimming.
                 ydl_opts['force_keyframes_at_cuts'] = True
-                
-                if not is_audio:
-                    ydl_opts.setdefault('external_downloader_args', {})
-                    ydl_opts['external_downloader_args']['ffmpeg'] = ['-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac']
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -896,7 +899,6 @@ class ProcessingOverlay(QWidget):
     app calls set_phase() as each real stage begins. Each stage is held
     on screen for at least MIN_DWELL_MS so quick stages stay readable,
     and the queued stages are shown in order."""
-    cancel_requested = Signal()
 
     # key, headline, tracker label, detail line
     STEPS = [
