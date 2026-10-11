@@ -21,24 +21,35 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QScrollArea, QFrame, QLineEdit, QProgressBar, 
                              QSpacerItem, QSizePolicy, QComboBox, QGraphicsDropShadowEffect,
                              QSystemTrayIcon, QStyle, QGraphicsOpacityEffect, QMenu, QFileDialog,
-                             QPlainTextEdit)
+                             QPlainTextEdit, QProxyStyle, QScrollBar)
 from PySide6.QtCore import (Qt, QThread, Signal, QSize, QObject, 
                           QTimer, QUrl, QVariantAnimation, QPropertyAnimation, QEasingCurve,
                           QPoint, QParallelAnimationGroup, QSequentialAnimationGroup, QEvent,
                           QElapsedTimer, QRect, QRectF, QPointF)
 from PySide6.QtGui import (QFont, QFontDatabase, QIcon, QPixmap, QImage, QColor, 
                          QPainter, QPainterPath, QCursor, QDesktopServices, QAction,
-                         QPen, QBrush, QLinearGradient, QRadialGradient, QFontMetrics)
+                         QPen, QBrush, QLinearGradient, QRadialGradient, QFontMetrics, QPalette)
 
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('mycompany.myapp.1.0')
 except Exception:
     pass
-try:
-    import yt_dlp
-except Exception:
-    yt_dlp = None
-    
+yt_dlp = None  # imported lazily - see _get_yt_dlp(). Importing it eagerly at
+               # startup costs real, measurable time (it pulls in every
+               # extractor module it ships with) for something nothing
+               # needs until a download actually starts.
+
+def _get_yt_dlp():
+    global yt_dlp
+    if yt_dlp is None:
+        try:
+            import yt_dlp as _yt_dlp
+            yt_dlp = _yt_dlp
+        except Exception:
+            yt_dlp = False
+    return yt_dlp or None
+
+
 repo_root = Path(__file__).resolve().parent
 BASE_DIR = Path(__file__).resolve().parent
 ICON_PATH = str(BASE_DIR / "icons/icon.ico")
@@ -72,6 +83,47 @@ _AUDIO_ONLY_DOMAINS = (
 
 def _is_audio_only_url(url):
     return any(d in url.lower() for d in _AUDIO_ONLY_DOMAINS)
+
+def _crisp_font(family, size, weight=None):
+    """Roboto-Regular.ttf is the only weight actually embedded (see
+    _setup_ui's QFontDatabase.addApplicationFont call) - every other
+    weight Qt renders for "Roboto" is synthesized from it. On Windows,
+    Qt/FreeType's default hinting combined with that synthesis is what
+    produces the stray-pixel artifacts above letters like e/m/n/a (this
+    never showed up in CustomTkinter, which uses native Windows text
+    rendering, not FreeType). Disabling hinting and ClearType-style
+    subpixel antialiasing - plain grayscale antialiasing instead - avoids
+    the glyph distortion that triggers it."""
+    f = QFont(family, size)
+    if weight is not None: f.setWeight(weight)
+    f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+    f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.NoSubpixelAntialias)
+    return f
+
+
+class NoFocusRectStyle(QProxyStyle):
+    """Suppresses the dotted keyboard-focus rectangle Windows draws on
+    buttons/widgets after Alt (or Ctrl, in some apps) is pressed a couple
+    times - toggling "keyboard cues" visibility is native Windows
+    behavior, not something tied to one widget, so this is handled once
+    at the style level rather than per-widget."""
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PrimitiveElement.PE_FrameFocusRect:
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
+class GlobalContextMenuBlocker(QObject):
+    """Blocks the native right-click/Menu-key flyout on every QLineEdit
+    (Undo/Redo/Cut/Copy/Paste/Select All) and QScrollBar (Scroll Here/
+    Top/Bottom/...) in the app, including ones created after this filter
+    is installed - an app-wide event filter instead of a per-widget
+    setContextMenuPolicy call, so nothing added later needs remembering."""
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ContextMenu and isinstance(obj, (QLineEdit, QScrollBar)):
+            return True
+        return super().eventFilter(obj, event)
+
 
 def _is_youtube_url(url):
     return any(d in url.lower() for d in
@@ -175,6 +227,10 @@ def fetcher_download(url, selected_fid=None, out_dir=None, is_audio=False, start
     def run_dl():
         try:
             import glob
+            ydl_mod = _get_yt_dlp()
+            if ydl_mod is None:
+                q.put({"type": "error", "message": "yt-dlp library missing"})
+                return
             os.makedirs(out_dir, exist_ok=True)
             ydl_opts = {
                 'outtmpl': os.path.join(out_dir, '%(title)s.%(ext)s'),
@@ -227,7 +283,7 @@ def fetcher_download(url, selected_fid=None, out_dir=None, is_audio=False, start
                 # the actual source of the high CPU usage during trimming.
                 ydl_opts['force_keyframes_at_cuts'] = True
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with ydl_mod.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if info is None:
                     raise Exception("Could not extract video information")
@@ -617,7 +673,7 @@ class FilterTab(QFrame):
         self.layout.setContentsMargins(16, 0, 16, 0)
         self.layout.setSpacing(8)
         self.text_lbl = QLabel(name)
-        self.text_lbl.setFont(QFont("Roboto", 10, QFont.Weight.Medium))
+        self.text_lbl.setFont(_crisp_font("Roboto", 10, QFont.Weight.Medium))
         self.badge_lbl = QLabel(str(count if count < 100 else "99+"))
         self.badge_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.badge_lbl.setFixedHeight(20)
@@ -738,7 +794,7 @@ class SidebarNavButton(QFrame):
         self.icon_lbl.setStyleSheet("background: transparent; border: none;")
         
         self.text_lbl = QLabel(name)
-        self.text_lbl.setFont(QFont("Roboto", 11, QFont.Weight.Medium))
+        self.text_lbl.setFont(_crisp_font("Roboto", 11, QFont.Weight.Medium))
         self.text_lbl.setMinimumWidth(0)
         
         layout.addWidget(self.icon_lbl)
@@ -1473,7 +1529,7 @@ class DynamicPC(QMainWindow):
         self.signals.home_phase.connect(self._on_home_phase)
         font_path = str(repo_root / "assets" / "Roboto-Regular.ttf")
         if os.path.exists(font_path): QFontDatabase.addApplicationFont(font_path)
-        app_font = QFont("Roboto", 10)
+        app_font = _crisp_font("Roboto", 10)
         app_font.setStyleHint(QFont.StyleHint.SansSerif)
         QApplication.setFont(app_font)
         self._dl_items, self._dl_cards, self._dl_tab_filter, self._last_url = [], {}, "All", ""
@@ -2495,9 +2551,32 @@ class DynamicPC(QMainWindow):
         if item.status == "done" and not getattr(item, "_notified", False):
             item._notified = True; self._show_download_notification(item)
 
-if __name__ == "__main__":
+def configure_app(app):
+    """App-wide Qt configuration. Split out of the __main__ block so
+    launcher.py (the light startup stub that shows a splash screen first)
+    can apply exactly the same setup to the QApplication it already
+    created, instead of duplicating it."""
+    app.setWindowIcon(QIcon(str(repo_root / "icons" / "icon.ico")))
+
+    app.setStyle(NoFocusRectStyle(app.style()))
+
+    ctx_menu_blocker = GlobalContextMenuBlocker(app)
+    app.installEventFilter(ctx_menu_blocker)
+    app._ctx_menu_blocker = ctx_menu_blocker  # keep a Python ref alive
+
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(TEAL_ACCENT))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    app.setPalette(palette)
+
+
+def main():
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("icons/icon.ico"))
+    configure_app(app)
     window = DynamicPC()
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

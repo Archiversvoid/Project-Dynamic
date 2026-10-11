@@ -13,14 +13,14 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QLineEdit, QComboBox, 
                              QProgressBar, QFrame, QGraphicsDropShadowEffect,
                              QGridLayout, QSpacerItem, QSizePolicy,
-                             QGraphicsOpacityEffect, QPlainTextEdit)
+                             QGraphicsOpacityEffect, QPlainTextEdit, QProxyStyle, QStyle, QScrollBar)
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtCore import (Qt, QUrl, Signal, QPointF, QRectF, QLineF, QObject, QTimer, 
                           QPropertyAnimation, QSequentialAnimationGroup, QParallelAnimationGroup, 
                           QPoint, QEasingCurve, QEvent, QRect, QElapsedTimer, QVariantAnimation)
 from PySide6.QtGui import (QFont, QPainter, QColor, QPen, QCursor, QPixmap, QIcon, QDesktopServices,
-                         QPainterPath, QBrush, QLinearGradient, QRadialGradient, QFontMetrics)
+                         QPainterPath, QBrush, QLinearGradient, QRadialGradient, QFontMetrics, QPalette)
 
 try:
     from PySide6.QtSvgWidgets import QSvgWidget
@@ -29,13 +29,24 @@ try:
 except ImportError:
     HAS_SVG = False
 
-try:
-    import yt_dlp
-    import builtins
-    # Inject yt_dlp globally so the DownloadWorker in main.py can access it for range functions
-    builtins.yt_dlp = yt_dlp
-except ImportError:
-    yt_dlp = None
+yt_dlp = None  # imported lazily - see _get_yt_dlp(). main.py (the actual
+               # download path) has its own independent lazy import; this
+               # file only needs yt_dlp for the preview/metadata fetch in
+               # _scrape_and_load, so there's no reason to pay for the
+               # import before that actually runs either. The old
+               # builtins.yt_dlp injection here is removed - main.py
+               # doesn't read from builtins, it has always had (and still
+               # has) its own import, so that was dead code.
+
+def _get_yt_dlp():
+    global yt_dlp
+    if yt_dlp is None:
+        try:
+            import yt_dlp as _yt_dlp
+            yt_dlp = _yt_dlp
+        except Exception:
+            yt_dlp = False
+    return yt_dlp or None
 
 # Cache Directories
 repo_root = Path(__file__).resolve().parent
@@ -63,6 +74,29 @@ _AUDIO_ONLY_DOMAINS = (
     "bandcamp.com", "audiomack.com", "reverbnation.com",
     "mixcloud.com",
 )
+
+
+class NoFocusRectStyle(QProxyStyle):
+    """Suppresses the dotted keyboard-focus rectangle Windows draws on
+    buttons/widgets after Alt is pressed a couple times. Local copy for
+    when this file is run standalone (see the __main__ block below) -
+    when embedded in main.py, that file's QApplication-level style
+    already covers every widget here too, this just keeps standalone
+    testing consistent with the real app."""
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PrimitiveElement.PE_FrameFocusRect:
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
+class GlobalContextMenuBlocker(QObject):
+    """Blocks the native right-click/Menu-key flyout on every QLineEdit
+    and QScrollBar. Local copy for standalone runs, same reasoning as
+    NoFocusRectStyle above."""
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ContextMenu and isinstance(obj, (QLineEdit, QScrollBar)):
+            return True
+        return super().eventFilter(obj, event)
 
 
 def _is_audio_only_url(url):
@@ -1594,7 +1628,8 @@ class TrimLoadTab(QWidget):
         threading.Thread(target=self._scrape_and_load, args=(url, run_id, cancelled), daemon=True).start()
 
     def _scrape_and_load(self, url, run_id, cancelled):
-        if not yt_dlp:
+        ydl_mod = _get_yt_dlp()
+        if ydl_mod is None:
             self.signals.error.emit(run_id, "yt-dlp library missing")
             return
 
@@ -1615,7 +1650,7 @@ class TrimLoadTab(QWidget):
                 ydl_opts['extractor_args'] = {'youtube': ['player_client=tv,web_safari']}
                 ydl_opts['http_headers'] = {'Accept-Language': 'en-US,en;q=0.9'}
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with ydl_mod.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             if cancelled[0]: return
 
@@ -1996,6 +2031,17 @@ class TrimLoadTab(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    app.setStyle(NoFocusRectStyle(app.style()))
+
+    ctx_menu_blocker = GlobalContextMenuBlocker(app)
+    app.installEventFilter(ctx_menu_blocker)
+
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(TEAL_ACCENT))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    app.setPalette(palette)
+
     window = TrimLoadTab()
     window.resize(900, 600)
     window.show()
