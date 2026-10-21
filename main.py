@@ -28,7 +28,9 @@ from PySide6.QtCore import (Qt, QThread, Signal, QSize, QObject,
                           QElapsedTimer, QRect, QRectF, QPointF)
 from PySide6.QtGui import (QFont, QFontDatabase, QIcon, QPixmap, QImage, QColor, 
                          QPainter, QPainterPath, QCursor, QDesktopServices, QAction,
-                         QPen, QBrush, QLinearGradient, QRadialGradient, QFontMetrics, QPalette)
+                         QPen, QBrush, QLinearGradient, QRadialGradient, QFontMetrics, QPalette, QTransform)
+import theme
+from theme import ss as _ss, qc as _qc
 
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('mycompany.myapp.1.0')
@@ -99,6 +101,123 @@ def _crisp_font(family, size, weight=None):
     f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.NoSubpixelAntialias)
     return f
+
+
+APP_VERSION = "1.0.0"   # shown on Settings > Update. Edit when you cut a release.
+FEEDBACK_BUG_URL = ""       # e.g. a GitHub "new issue" link. Empty = shows "not set up yet".
+FEEDBACK_FEATURE_URL = ""   # e.g. a GitHub "feature request" link.
+
+COMBO_QSS = """
+    QComboBox { background-color: #1A1A1A; color: #FFFFFF; font-size: 14px; border-radius: 6px; padding: 5px 12px; border: 1px solid #2A2A2A; }
+    QComboBox::drop-down { border: none; width: 0px; }
+    QComboBox::down-arrow { image: none; border: none; }
+    QComboBox QAbstractItemView { background-color: #181818; color: #FFFFFF; selection-background-color: #B5B5B5; selection-color: #000000; border: 1px solid #FFFFFF; border-radius: 4px; outline: none; padding: 2px 0px; }
+    QComboBox QAbstractItemView::item { min-height: 26px; padding-left: 10px; color: #FFFFFF; }
+    QComboBox QAbstractItemView::item:selected { background-color: #B5B5B5; color: #000000; }
+"""
+
+_MONO_FAMILY = None
+def _mono_family():
+    """A fixed-width font family that is actually installed. "monospace" and
+    "sans-serif" are CSS generics, not real Windows fonts: when Qt is asked
+    for a family that doesn't exist it searches by loading font files to
+    resolve the name, which the startup profile measured at ~3.7 s for a
+    single QPlainTextEdit. Always ask for a family that exists."""
+    global _MONO_FAMILY
+    if _MONO_FAMILY is None:
+        for fam in ("Consolas", "Cascadia Mono", "Courier New"):
+            if QFontDatabase.hasFamily(fam):
+                _MONO_FAMILY = fam
+                break
+        else:
+            _MONO_FAMILY = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont).family()
+    return _MONO_FAMILY
+
+
+def _pkg_version(name):
+    try:
+        from importlib.metadata import version   # reads metadata only; does not import the package
+        return version(name)
+    except Exception:
+        return None
+
+
+def _ffmpeg_version_text():
+    try:
+        exe = None
+        for n in ("ffmpeg.exe", "ffmpeg"):
+            p = repo_root / n
+            if p.exists():
+                exe = str(p); break
+        exe = exe or shutil.which("ffmpeg")
+        if not exe: return "Not found"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        out = subprocess.run([exe, "-version"], capture_output=True, text=True, timeout=5, creationflags=flags).stdout
+        first = out.splitlines()[0] if out else ""
+        parts = first.split()
+        return parts[2] if len(parts) >= 3 and parts[1] == "version" else (first or "Unknown")
+    except Exception:
+        return "Unknown"
+
+
+class SettingsRow(QFrame):
+    """One row of a settings card: title + optional subtitle on the left, and
+    on the right either a custom control (combo box, value label) or a
+    navigation arrow. Rows with an arrow are clickable."""
+    clicked = Signal()
+
+    def __init__(self, title, subtitle="", position="middle", arrow_pixmap=None, control=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("settingsRow")
+        self._clickable = control is None and arrow_pixmap is not None
+        self.setMinimumHeight(78 if subtitle else 68)
+        radius = {"top": "border-top-left-radius: 13px; border-top-right-radius: 13px;",
+                  "bottom": "border-bottom-left-radius: 13px; border-bottom-right-radius: 13px;",
+                  "single": "border-radius: 13px;"}.get(position, "")
+        hover = "QFrame#settingsRow:hover { background-color: #242424; }" if self._clickable else ""
+        _ss(self, f"QFrame#settingsRow {{ background: transparent; border: none; {radius} }} {hover}")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(26, 12, 22, 12)
+        lay.setSpacing(16)
+        col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(4)
+        t = QLabel(title)
+        _ss(t, f"color: {TEXT_MAIN}; font-size: 19px; background: transparent; border: none;")
+        col.addWidget(t)
+        if subtitle:
+            s = QLabel(subtitle)
+            _ss(s, f"color: {TEXT_MUTED}; font-size: 14px; background: transparent; border: none;")
+            col.addWidget(s)
+        lay.addLayout(col, 1)
+        if control is not None:
+            lay.addWidget(control)
+        elif arrow_pixmap is not None:
+            a = QLabel(); a.setFixedSize(22, 22)
+            _ss(a, f"color: {TEXT_MUTED}; font-size: 20px; background: transparent; border: none;")
+            if not arrow_pixmap.isNull(): a.setPixmap(arrow_pixmap); a.setProperty("_arrow", True)
+            else: a.setText("→")
+            lay.addWidget(a)
+        if self._clickable:
+            self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def mousePressEvent(self, e):
+        if self._clickable and e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
+def _tint_overlay(alpha_dark, alpha_light):
+    """Translucent fill used for hover/chip tints: white-on-dark, black-on-light."""
+    return QColor(0, 0, 0, alpha_light) if theme.is_light() else QColor(255, 255, 255, alpha_dark)
+
+
+def _hover_overlay():
+    return _tint_overlay(18, 12)
+
+
+def _white_sheen(alpha_dark, alpha_light):
+    """The moving highlight on skeleton blocks: faint on dark, strong on light."""
+    return QColor(255, 255, 255, alpha_light if theme.is_light() else alpha_dark)
 
 
 class NoFocusRectStyle(QProxyStyle):
@@ -370,7 +489,7 @@ class ToastWidget(QFrame):
         super().__init__(parent)
         self.setWindowIcon(QIcon(ICON_PATH))
         self.setFixedSize(290, 48)
-        self.setStyleSheet("QFrame { background-color: #242424; border: 1px solid #333333; border-radius: 12px; }")
+        _ss(self, "QFrame { background-color: #242424; border: 1px solid #333333; border-radius: 12px; }")
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(16)
         shadow.setColor(QColor(0, 0, 0, 160))
@@ -383,20 +502,20 @@ class ToastWidget(QFrame):
             icon_lbl = QLabel()
             icon_lbl.setFixedSize(22, 22)
             icon_lbl.setPixmap(icon_pixmap)
-            icon_lbl.setStyleSheet("background: transparent; border: none;")
+            _ss(icon_lbl, "background: transparent; border: none;")
         else:
             icon_lbl = QLabel("✕")
-            icon_lbl.setStyleSheet("color: #EF4444; font-size: 15px; font-weight: bold; border: none; background: transparent;")
+            _ss(icon_lbl, "color: #EF4444; font-size: 15px; font-weight: bold; border: none; background: transparent;")
         layout.addWidget(icon_lbl)
         msg_lbl = QLabel(message)
         if rich_text:
             msg_lbl.setTextFormat(Qt.TextFormat.RichText)
-        msg_lbl.setStyleSheet("color: #FFFFFF; font-size: 13px; font-weight: 500; border: none; background: transparent;")
+        _ss(msg_lbl, "color: #FFFFFF; font-size: 13px; font-weight: 500; border: none; background: transparent;")
         layout.addWidget(msg_lbl, 1)
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(22, 22)
         close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        close_btn.setStyleSheet("QPushButton { color: #888888; font-size: 13px; font-weight: bold; border: none; background: transparent; } QPushButton:hover { color: #FFFFFF; }")
+        _ss(close_btn, "QPushButton { color: #888888; font-size: 13px; font-weight: bold; border: none; background: transparent; } QPushButton:hover { color: #FFFFFF; }")
         close_btn.clicked.connect(self.close_toast)
         layout.addWidget(close_btn)
         self.timer = QTimer(self)
@@ -526,7 +645,7 @@ class ModernScrollArea(QScrollArea):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setStyleSheet("""
+        _ss(self, """
             QScrollArea { background-color: transparent; border: none; }
             QScrollBar:vertical { width: 8px; background: transparent; margin: 0px; }
             QScrollBar::handle:vertical { background-color: #444444; border-radius: 4px; min-height: 40px; }
@@ -561,7 +680,7 @@ class SkeletonBox(QFrame):
             self.setFixedWidth(width)
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setStyleSheet(f"background-color: {CARD_INNER_BG}; border-radius: {radius}px; border: none;")
+        _ss(self, f"background-color: {CARD_INNER_BG}; border-radius: {radius}px; border: none;")
         effect = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(effect)
         anim = QPropertyAnimation(effect, b"opacity", self)
@@ -595,7 +714,7 @@ class ShimmerBox(QFrame):
         else:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._radius = radius
-        self.setStyleSheet("background: transparent; border: none;")
+        _ss(self, "background: transparent; border: none;")
         ShimmerBox._instances.append(self)
         if ShimmerBox._clock is None:
             ShimmerBox._clock = QElapsedTimer()
@@ -647,7 +766,7 @@ class ShimmerBox(QFrame):
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), self._radius, self._radius)
         p.setClipPath(path)
-        p.fillRect(self.rect(), QColor(CARD_INNER_BG))
+        p.fillRect(self.rect(), _qc(CARD_INNER_BG))
         now = ShimmerBox._clock.elapsed()
         period = 1400.0
         t = (now % period) / period
@@ -656,7 +775,7 @@ class ShimmerBox(QFrame):
         x = -band_w + (w + band_w) * t
         g = QLinearGradient(x, 0, x + band_w, 0)
         c0 = QColor(255, 255, 255, 0)
-        c1 = QColor(255, 255, 255, 26)
+        c1 = _white_sheen(26, 150)
         g.setColorAt(0.0, c0); g.setColorAt(0.5, c1); g.setColorAt(1.0, c0)
         p.fillRect(self.rect(), QBrush(g))
         p.end()
@@ -683,9 +802,7 @@ class FilterTab(QFrame):
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(250)
         self._anim.valueChanged.connect(self._on_anim_step)
-        self._current_text = QColor(TEAL_ACCENT) if is_active else QColor("#E0E0E0")
-        self._current_badge_bg = QColor("#1B3D37") if is_active else QColor("#3D3D3D")
-        self._current_bg = QColor("#142C28") if is_active else QColor("#2A2A2A")
+        self._current_text, self._current_badge_bg, self._current_bg = self._colors(is_active)
         self._update_stylesheet()
     def update_count(self, count):
         if self._count != count:
@@ -694,9 +811,7 @@ class FilterTab(QFrame):
     def set_active(self, active):
         if self._is_active == active: return
         self._is_active = active
-        self._animate_colors(QColor(TEAL_ACCENT) if active else QColor("#E0E0E0"), 
-                             QColor("#1B3D37") if active else QColor("#3D3D3D"), 
-                             QColor("#142C28") if active else QColor("#2A2A2A"), 250)
+        self._animate_colors(*self._colors(active), 250)
     def _animate_colors(self, t_text, t_badge, t_bg, duration):
         self._anim.stop()
         self._anim.setDuration(duration)
@@ -714,16 +829,31 @@ class FilterTab(QFrame):
         return QColor(int(c1.red() + (c2.red() - c1.red()) * factor), 
                       int(c1.green() + (c2.green() - c1.green()) * factor), 
                       int(c1.blue() + (c2.blue() - c1.blue()) * factor))
+    def _colors(self, active, hover=False):
+        """(text, badge bg, tab bg) for the current theme. These are already
+        themed QColors, which is why _update_stylesheet below applies its
+        stylesheets raw instead of through _ss (it would map them twice)."""
+        if active:
+            return QColor(theme.accent_text()), _qc("#1B3D37", "bg"), _qc("#142C28", "bg")
+        if hover:
+            return _qc("#FFFFFF", "text"), _qc("#555555", "bg"), _qc("#333333", "bg")
+        return _qc("#E0E0E0", "text"), _qc("#3D3D3D", "bg"), _qc("#2A2A2A", "bg")
+
+    def apply_theme(self):
+        self._anim.stop()
+        self._current_text, self._current_badge_bg, self._current_bg = self._colors(self._is_active)
+        self._update_stylesheet()
+
     def _update_stylesheet(self):
         text, badge_bg, bg = self._current_text.name(), self._current_badge_bg.name(), self._current_bg.name()
-        self.setStyleSheet(f"FilterTab {{ background-color: {bg}; border-radius: 16px; border: none; }}")
-        self.text_lbl.setStyleSheet(f"color: {text}; border: none; background: transparent;")
-        self.badge_lbl.setStyleSheet(f'background-color: {badge_bg}; color: {text}; border-radius: 10px; min-width: 14px; font-size: 11px; font-weight: bold; padding: 0px 8px; border: none;')
+        self.setStyleSheet(f"FilterTab {{ background-color: {bg}; border-radius: 16px; border: none; }}")  # theme: raw
+        self.text_lbl.setStyleSheet(f"color: {text}; border: none; background: transparent;")  # theme: raw
+        self.badge_lbl.setStyleSheet(f'background-color: {badge_bg}; color: {text}; border-radius: 10px; min-width: 14px; font-size: 11px; font-weight: bold; padding: 0px 8px; border: none;')  # theme: raw
     def enterEvent(self, event):
-        if not self._is_active: self._animate_colors(QColor("#FFFFFF"), QColor("#555555"), QColor("#333333"), 150)
+        if not self._is_active: self._animate_colors(*self._colors(False, hover=True), 150)
         super().enterEvent(event)
     def leaveEvent(self, event):
-        if not self._is_active: self._animate_colors(QColor("#E0E0E0"), QColor("#3D3D3D"), QColor("#2A2A2A"), 150)
+        if not self._is_active: self._animate_colors(*self._colors(False), 150)
         super().leaveEvent(event)
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton: self.clicked.emit(self.name)
@@ -736,7 +866,7 @@ class FilterTabBar(QFrame):
         self.tabs = {}
         self.active_tab = filters[0]
         self.indicator = QFrame(self)
-        self.indicator.setStyleSheet("background-color: transparent; border: none; border-radius: 16px;")
+        _ss(self.indicator, "background-color: transparent; border: none; border-radius: 16px;")
         self.anim = QPropertyAnimation(self.indicator, b"geometry")
         self.anim.setDuration(350)
         self.anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
@@ -782,7 +912,7 @@ class SidebarNavButton(QFrame):
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setFixedHeight(44)
         
-        self.setStyleSheet("SidebarNavButton { background: transparent; border: none; }")
+        _ss(self, "SidebarNavButton { background: transparent; border: none; }")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(11, 0, 11, 0)
@@ -791,7 +921,7 @@ class SidebarNavButton(QFrame):
         self.icon_lbl = QLabel()
         self.icon_lbl.setPixmap(icon.pixmap(22, 22))
         self.icon_lbl.setFixedSize(22, 22)
-        self.icon_lbl.setStyleSheet("background: transparent; border: none;")
+        _ss(self.icon_lbl, "background: transparent; border: none;")
         
         self.text_lbl = QLabel(name)
         self.text_lbl.setFont(_crisp_font("Roboto", 11, QFont.Weight.Medium))
@@ -804,8 +934,8 @@ class SidebarNavButton(QFrame):
         self._color_anim.setDuration(220)
         self._color_anim.valueChanged.connect(self._on_color_step)
 
-        self._current_text = QColor(TEAL_ACCENT) if is_active else QColor(TEXT_MUTED)
-        self._current_bg = QColor(20, 44, 40, 255) if is_active else QColor(0, 0, 0, 0)
+        self._current_text = self._text_for(is_active)
+        self._current_bg = self._bg_for(is_active)
         self._update_text_color()
 
         self._ripple_pos = QPoint(0, 0)
@@ -824,9 +954,26 @@ class SidebarNavButton(QFrame):
         self.text_lbl.setGraphicsEffect(self._text_opacity)
         self._text_opacity.setOpacity(1.0)
 
+    def _text_for(self, active):
+        """Already-themed QColors (see FilterTab._colors for why that matters)."""
+        return QColor(theme.accent_text()) if active else _qc(TEXT_MUTED)
+
+    def _bg_for(self, active):
+        return _qc("#142C28", "bg") if active else QColor(0, 0, 0, 0)
+
+    def apply_theme(self):
+        self._color_anim.stop()
+        self._current_text = self._text_for(self._is_active)
+        self._current_bg = self._bg_for(self._is_active)
+        self._update_text_color()
+        self.update()
+
+    def set_icon(self, icon):
+        self.icon_lbl.setPixmap(icon.pixmap(22, 22))
+
     def _update_text_color(self):
         text = self._current_text.name()
-        self.text_lbl.setStyleSheet(f"color: {text}; border: none; background: transparent;")
+        self.text_lbl.setStyleSheet(f"color: {text}; border: none; background: transparent;")  # theme: raw
         self.update()
 
     def _on_color_step(self, progress):
@@ -844,7 +991,7 @@ class SidebarNavButton(QFrame):
 
         if self._ripple_opacity > 0:
             painter.setClipPath(bg_path)
-            ripple_color = QColor(TEAL_ACCENT)
+            ripple_color = _qc(TEAL_ACCENT)
             ripple_color.setAlphaF(self._ripple_opacity)
             painter.setBrush(ripple_color)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -854,8 +1001,8 @@ class SidebarNavButton(QFrame):
         if self._is_active == active:
             return
         self._is_active = active
-        target_text = QColor(TEAL_ACCENT) if active else QColor(TEXT_MUTED)
-        target_bg = QColor(20, 44, 40, 255) if active else QColor(0, 0, 0, 0)
+        target_text = self._text_for(active)
+        target_bg = self._bg_for(active)
         if animate:
             self._animate_to(target_text, target_bg, 220)
         else:
@@ -881,12 +1028,12 @@ class SidebarNavButton(QFrame):
 
     def enterEvent(self, event):
         if not self._is_active:
-            self._animate_to(QColor(TEXT_MUTED), QColor(255, 255, 255, 18), 150)
+            self._animate_to(self._text_for(False), _hover_overlay(), 150)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         if not self._is_active:
-            self._animate_to(QColor(TEXT_MUTED), QColor(0, 0, 0, 0), 150)
+            self._animate_to(self._text_for(False), QColor(0, 0, 0, 0), 150)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -1037,19 +1184,19 @@ class ProcessingOverlay(QWidget):
     def _build_buttons(self):
         self._btn_cancel = QPushButton("Cancel", self)
         self._btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_cancel.setStyleSheet(self._pill_style(filled=False))
+        _ss(self._btn_cancel, self._pill_style(filled=False))
         self._btn_cancel.clicked.connect(self.cancel_requested.emit)
         self._cancel_fx = self._fade_with_overlay(self._btn_cancel)
 
         self._btn_retry = QPushButton("Try Again", self)
         self._btn_retry.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_retry.setStyleSheet(self._pill_style(filled=True))
+        _ss(self._btn_retry, self._pill_style(filled=True))
         self._btn_retry.clicked.connect(self.retry_requested.emit)
         self._retry_fx = self._fade_with_overlay(self._btn_retry)
 
         self._btn_log = QPushButton("Error Log", self)
         self._btn_log.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_log.setStyleSheet(self._pill_style(filled=False))
+        _ss(self._btn_log, self._pill_style(filled=False))
         self._btn_log.clicked.connect(self._toggle_log)
         self._log_btn_fx = self._fade_with_overlay(self._btn_log)
 
@@ -1058,13 +1205,13 @@ class ProcessingOverlay(QWidget):
 
     def _build_log_panel(self):
         self._log_panel = QFrame(self)
-        self._log_panel.setStyleSheet("QFrame { background-color: #161616; border: 1px solid #2E2E2E; border-radius: 10px; }")
+        _ss(self._log_panel, "QFrame { background-color: #161616; border: 1px solid #2E2E2E; border-radius: 10px; }")
         lay = QVBoxLayout(self._log_panel)
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(8)
         header = QHBoxLayout()
         title = QLabel("Error details")
-        title.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+        _ss(title, f"color: {TEXT_MUTED}; font-size: 11px; font-weight: bold; border: none; background: transparent;")
         header.addWidget(title)
         header.addStretch()
         self._btn_copy = QPushButton("Copy")
@@ -1075,14 +1222,14 @@ class ProcessingOverlay(QWidget):
                                     f"QPushButton:hover {{ border-color: {TEAL_ACCENT}; color: {TEXT_MAIN}; }}")
         self._copy_style_done = (f"QPushButton {{ background: transparent; border: 1px solid {TEAL_ACCENT}; border-radius: 12px; "
                                   f"color: {TEAL_ACCENT}; font-size: 11px; font-weight: bold; }}")
-        self._btn_copy.setStyleSheet(self._copy_style_normal)
+        _ss(self._btn_copy, self._copy_style_normal)
         self._btn_copy.clicked.connect(self._copy_error_text)
         header.addWidget(self._btn_copy)
         lay.addLayout(header)
         self._log_text = QPlainTextEdit()
         self._log_text.setReadOnly(True)
-        self._log_text.setStyleSheet(f"QPlainTextEdit {{ background: transparent; border: none; color: {ERROR_RED}; "
-                                       f"font-family: Consolas, monospace; font-size: 11px; }}")
+        _ss(self._log_text, f"QPlainTextEdit {{ background: transparent; border: none; color: {ERROR_RED}; "
+                                       f"font-family: '{_mono_family()}'; font-size: 11px; }}")
         lay.addWidget(self._log_text, 1)
         self._log_panel.hide()
         self._log_fx = self._fade_with_overlay(self._log_panel)
@@ -1094,12 +1241,12 @@ class ProcessingOverlay(QWidget):
     def _copy_error_text(self):
         QApplication.clipboard().setText(self._error_text)
         self._btn_copy.setText("Copied")
-        self._btn_copy.setStyleSheet(self._copy_style_done)
+        _ss(self._btn_copy, self._copy_style_done)
         QTimer.singleShot(1500, self._reset_copy_button)
 
     def _reset_copy_button(self):
         self._btn_copy.setText("Copy")
-        self._btn_copy.setStyleSheet(self._copy_style_normal)
+        _ss(self._btn_copy, self._copy_style_normal)
 
     def _toggle_log(self):
         self._log_open = not self._log_open
@@ -1347,14 +1494,14 @@ class ProcessingOverlay(QWidget):
         headline = "Couldn't process link" if failed else self.STEPS[idx][1]
         detail = "Check the link and try again" if failed else self.STEPS[idx][3].format(host=self._host)
         hf = self._font(38, QFont.Weight.Light)
-        p.setFont(hf); p.setPen(QColor(TEXT_MAIN))
+        p.setFont(hf); p.setPen(_qc(TEXT_MAIN))
         p.drawText(QRectF(cx - 390, cy - 96 + dy, 780, 56), Qt.AlignmentFlag.AlignCenter, headline)
         if not failed and idx < len(self.STEPS) - 1:
             tw = QFontMetrics(hf).horizontalAdvance(headline)
             n = int(now / 380) % 4
-            p.setPen(QColor(TEAL_ACCENT))
+            p.setPen(_qc(TEAL_ACCENT))
             p.drawText(QRectF(cx + tw / 2 + 4, cy - 96 + dy, 60, 56), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "." * n)
-        p.setFont(self._font(14)); p.setPen(QColor(ERROR_RED if failed else TEXT_MUTED))
+        p.setFont(self._font(14)); p.setPen(_qc(ERROR_RED if failed else TEXT_MUTED))
         fm = QFontMetrics(p.font())
         p.drawText(QRectF(cx - 390, cy - 34 + dy, 780, 24), Qt.AlignmentFlag.AlignCenter,
                    fm.elidedText(detail, Qt.TextElideMode.ElideRight, 760))
@@ -1368,10 +1515,10 @@ class ProcessingOverlay(QWidget):
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setOpacity(a)
         now = self._clock.elapsed()
-        accent = self._lerp_color(QColor(TEAL_ACCENT), QColor(ERROR_RED), self._fail_color_t)
+        accent = self._lerp_color(_qc(TEAL_ACCENT), _qc(ERROR_RED), self._fail_color_t)
 
         # background + soft ambient glow
-        p.fillRect(event.rect(), QColor(BG_DARK))
+        p.fillRect(event.rect(), _qc(BG_DARK))
         c = self._center()
         glow = QRadialGradient(QPointF(c.x(), c.y() - 30), 380)
         g0 = QColor(accent); g0.setAlpha(24); g1 = QColor(accent); g1.setAlpha(0)
@@ -1388,13 +1535,13 @@ class ProcessingOverlay(QWidget):
         host = QFontMetrics(cf).elidedText(self._host, Qt.TextElideMode.ElideRight, 320)
         tw = QFontMetrics(cf).horizontalAdvance(host)
         chip = QRectF(cx - (tw + 46) / 2, cy - 138, tw + 46, 28)
-        p.setPen(QPen(QColor("#2C2C2C"), 1)); p.setBrush(QColor(255, 255, 255, 7))
+        p.setPen(QPen(_qc("#2C2C2C"), 1)); p.setBrush(_tint_overlay(7, 6))
         p.drawRoundedRect(chip, 14, 14)
         pulse = 0.5 + 0.5 * math.sin(now / 260.0)
         dot = QColor(accent); dot.setAlpha(int(110 + 145 * pulse))
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(dot)
         p.drawEllipse(QPointF(chip.left() + 16, chip.center().y()), 3, 3)
-        p.setFont(cf); p.setPen(QColor(TEXT_MUTED))
+        p.setFont(cf); p.setPen(_qc(TEXT_MUTED))
         p.drawText(QRectF(chip.left() + 27, chip.top(), tw + 12, chip.height()),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, host)
 
@@ -1412,11 +1559,11 @@ class ProcessingOverlay(QWidget):
         x0 = cx - spacing * (n - 1) / 2
         for i in range(n - 1):
             xa, xb = x0 + i * spacing + r + 7, x0 + (i + 1) * spacing - r - 7
-            p.setPen(QPen(QColor("#2A2A2A"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setPen(QPen(_qc("#2A2A2A"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawLine(QPointF(xa, ty), QPointF(xb, ty))
             if self._done_at[i] is not None:
                 fp = self._ease.valueForProgress(max(0.0, min(1.0, (now - self._done_at[i]) / 320.0)))
-                p.setPen(QPen(QColor(TEAL_ACCENT), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setPen(QPen(_qc(TEAL_ACCENT), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.drawLine(QPointF(xa, ty), QPointF(xa + (xb - xa) * fp, ty))
         lf = self._font(11, None, 0.6)
         for i in range(n):
@@ -1424,35 +1571,35 @@ class ProcessingOverlay(QWidget):
             done = self._done_at[i] is not None
             is_active = (i == self._active) and not done
             if self._failed and i == self._active:
-                p.setPen(QPen(QColor(ERROR_RED), 2)); p.setBrush(QColor(ERROR_RED))
+                p.setPen(QPen(_qc(ERROR_RED), 2)); p.setBrush(_qc(ERROR_RED))
                 p.drawEllipse(QPointF(x, ty), r, r)
-                p.setPen(QPen(QColor("#0B0B0B"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setPen(QPen(_qc("#0B0B0B"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.drawLine(QPointF(x - 3, ty - 3), QPointF(x + 3, ty + 3)); p.drawLine(QPointF(x + 3, ty - 3), QPointF(x - 3, ty + 3))
-                lab = QColor(ERROR_RED)
+                lab = _qc(ERROR_RED)
             elif done:
                 e = self._ease.valueForProgress(max(0.0, min(1.0, (now - self._done_at[i]) / 280.0)))
-                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(TEAL_ACCENT))
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(_qc(TEAL_ACCENT))
                 p.drawEllipse(QPointF(x, ty), r * (0.55 + 0.45 * e), r * (0.55 + 0.45 * e))
-                ck = QColor("#0B0B0B"); ck.setAlphaF(e)
+                ck = _qc("#0B0B0B"); ck.setAlphaF(e)
                 p.setPen(QPen(ck, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)); p.setBrush(Qt.BrushStyle.NoBrush)
                 path = QPainterPath(); path.moveTo(x - 3.6, ty + 0.4); path.lineTo(x - 1.0, ty + 3.0); path.lineTo(x + 3.8, ty - 2.8)
                 p.drawPath(path)
-                lab = QColor("#9A9A9A")
+                lab = _qc("#9A9A9A")
             elif is_active:
                 ph = (now % 1300) / 1300.0
-                halo = QColor(TEAL_ACCENT); halo.setAlpha(int(95 * (1 - ph)))
+                halo = _qc(TEAL_ACCENT); halo.setAlpha(int(95 * (1 - ph)))
                 p.setPen(Qt.PenStyle.NoPen); p.setBrush(halo)
                 p.drawEllipse(QPointF(x, ty), r + 2 + 9 * ph, r + 2 + 9 * ph)
-                p.setPen(QPen(QColor(TEAL_ACCENT), 2)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(_qc(TEAL_ACCENT), 2)); p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QPointF(x, ty), r, r)
                 br = 3.2 + 0.8 * math.sin(now / 200.0)
-                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(TEAL_ACCENT))
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(_qc(TEAL_ACCENT))
                 p.drawEllipse(QPointF(x, ty), br, br)
-                lab = QColor(TEXT_MAIN)
+                lab = _qc(TEXT_MAIN)
             else:
-                p.setPen(QPen(QColor("#3A3A3A"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(_qc("#3A3A3A"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QPointF(x, ty), r - 1, r - 1)
-                lab = QColor("#555555")
+                lab = _qc("#555555")
             p.setFont(lf); p.setPen(lab)
             p.drawText(QRectF(x - 50, ty + r + 10, 100, 16), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self.STEPS[i][2])
 
@@ -1494,6 +1641,7 @@ class AppSignals(QObject):
     home_result = Signal(dict, str, object, object, object, object)
     home_error = Signal(str)
     home_phase = Signal(int, str)
+    ffmpeg_version = Signal(str)
 
 class DownloadItem:
     _counter = int(time.time())
@@ -1515,11 +1663,14 @@ class DynamicPC(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.settings = self._load_settings()
+        theme.set_mode(theme.resolve(self.settings.get("theme", "Default")))
+        self._apply_palette()
         self.setWindowTitle("Dynamic")
         self.resize(1100, 720)
         self.setWindowIcon(QIcon("icons/icon.ico"))
         self.setMinimumSize(1020, 640)
-        self.setStyleSheet(f"QMainWindow {{ background-color: {BG_DARK}; }}")
+        _ss(self, f"QMainWindow {{ background-color: {BG_DARK}; }}")
         self.toast_mgr = ToastManager(self)
         self.signals = AppSignals()
         self.signals.update_progress.connect(self._update_card_progress)
@@ -1527,6 +1678,7 @@ class DynamicPC(QMainWindow):
         self.signals.home_result.connect(self._on_home_result)
         self.signals.home_error.connect(self._on_home_error)
         self.signals.home_phase.connect(self._on_home_phase)
+        self.signals.ffmpeg_version.connect(self._on_ffmpeg_version)
         font_path = str(repo_root / "assets" / "Roboto-Regular.ttf")
         if os.path.exists(font_path): QFontDatabase.addApplicationFont(font_path)
         app_font = _crisp_font("Roboto", 10)
@@ -1534,7 +1686,7 @@ class DynamicPC(QMainWindow):
         QApplication.setFont(app_font)
         self._dl_items, self._dl_cards, self._dl_tab_filter, self._last_url = [], {}, "All", ""
         self._dl_list_dirty, self._dl_first_build_done = True, False
-        self.settings = self._load_settings()
+        # settings are loaded at the top of __init__ (theme must be known before any widget is built)
         self._load_icons()
         self._setup_tray_icon()
         self._load_downloads()
@@ -1545,6 +1697,7 @@ class DynamicPC(QMainWindow):
         default_settings = {
             "download_dir": str(repo_root / "downloads"),
             "sidebar_collapsed": False,  # Added default state
+            "theme": "Default",
         }
         settings_path = repo_root / "settings.json"
         if settings_path.exists():
@@ -1646,9 +1799,8 @@ class DynamicPC(QMainWindow):
 
     def _load_icons(self):
         self._icons = {}
-        for name in ["home", "scissors", "downloads", "settings", "pause", "play", "trash", "trash red", "retry", "check", "collapse", "expand"]:
-            path = repo_root / "icons" / f"{name}.png"
-            self._icons[name] = QIcon(str(path)) if path.exists() else QIcon()
+        for name in ["home", "scissors", "downloads", "settings", "pause", "play", "trash", "trash red", "retry", "check", "collapse", "expand", "arrow-right"]:
+            self._icons[name] = theme.icon(name, repo_root / "icons", cache_dir)
 
     def _load_downloads(self):
         file_path = repo_root / "downloads.json"
@@ -1714,7 +1866,7 @@ class DynamicPC(QMainWindow):
         # Set initial layout widths matching the saved state
         initial_width = self._sidebar_collapsed_w if self._sidebar_collapsed else self._sidebar_expanded_w
         self.sidebar.setFixedWidth(initial_width)
-        self.sidebar.setStyleSheet(f"QFrame {{ background-color: {SIDEBAR_DARK}; border: none; }}")
+        _ss(self.sidebar, f"QFrame {{ background-color: {SIDEBAR_DARK}; border: none; }}")
 
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(12, 28, 12, 20)
@@ -1728,7 +1880,7 @@ class DynamicPC(QMainWindow):
         self.menu_btn.setIconSize(QSize(22, 22))
         self.menu_btn.setFixedSize(44, 32)
         self.menu_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.menu_btn.setStyleSheet("QPushButton { background: transparent; border: none; border-radius: 8px; } QPushButton:hover { background-color: #222222; }")
+        _ss(self.menu_btn, "QPushButton { background: transparent; border: none; border-radius: 8px; } QPushButton:hover { background-color: #222222; }")
         self.menu_btn.clicked.connect(self._toggle_sidebar)
         sidebar_layout.addWidget(self.menu_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         sidebar_layout.addSpacing(20)
@@ -1742,6 +1894,7 @@ class DynamicPC(QMainWindow):
         nav_items = [("Home", "home", 0), ("TrimLoad", "scissors", 1), ("Downloads", "downloads", 2), ("Settings", "settings", 3)]
         for name, icon_name, idx in nav_items:
             btn = SidebarNavButton(name, self._icons.get(icon_name, QIcon()), idx, is_active=(idx == 0))
+            btn._icon_name = icon_name
             
             # Apply initial collapse status to each button without animation on launch
             btn.set_collapsed(self._sidebar_collapsed, animate=False)
@@ -1754,7 +1907,7 @@ class DynamicPC(QMainWindow):
         main_layout.addWidget(self.sidebar)
 
         self.stack = QStackedWidget()
-        self.stack.setStyleSheet(f"background-color: {BG_DARK};")
+        _ss(self.stack, f"background-color: {BG_DARK};")
         
         self.tab_home = QWidget()
         self._build_home_tab()
@@ -1771,48 +1924,334 @@ class DynamicPC(QMainWindow):
         self.stack.addWidget(self.tab_dl)
 
         self.tab_settings = QWidget()
-        self._build_settings_tab()
+        self._settings_built = False   # built on first visit (see _show_tab) so it costs nothing at startup
         self.stack.addWidget(self.tab_settings)
 
         main_layout.addWidget(self.stack)
 
+    # ------------------------------------------------------------------
+    # Settings tab. Built on first visit (see _show_tab).
+    # Pages in self.settings_stack: 0 list | 1 downloads | 2 update |
+    # 3 feedback | 4 about | 5 text viewer (terms / change log)
+    # ------------------------------------------------------------------
     def _build_settings_tab(self):
-        layout = QVBoxLayout(self.tab_settings)
-        layout.setContentsMargins(32, 28, 32, 12)
-        layout.setSpacing(20)
+        self._settings_built = True
+        root = QVBoxLayout(self.tab_settings)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.settings_stack = QStackedWidget()
+        root.addWidget(self.settings_stack)
 
-        lbl = QLabel("Settings")
-        lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 32px; font-weight: bold;")
-        layout.addWidget(lbl)
+        # decoded once and shared by every arrow in the tab
+        self._settings_arrow = self._icons.get("arrow-right", QIcon()).pixmap(20, 20)
+        for page in (self._build_settings_main_page(), self._build_settings_downloads_page(),
+                     self._build_settings_update_page(), self._build_settings_feedback_page(),
+                     self._build_settings_about_page(), self._build_settings_text_page()):
+            self.settings_stack.addWidget(page)
 
-        dir_layout = QHBoxLayout()
-        dir_lbl = QLabel("Download Directory:")
-        dir_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 16px;")
-        
+    def _open_settings_page(self, idx):
+        if idx == 2: self._refresh_update_info()
+        self.settings_stack.setCurrentIndex(idx)
+
+    def _settings_card(self):
+        card = QFrame(); card.setObjectName("settingsCard")
+        _ss(card, f"QFrame#settingsCard {{ background-color: {CARD_BG}; border: 1px solid #2A2A2A; border-radius: 14px; }}")
+        lay = QVBoxLayout(card); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+        return card, lay
+
+    def _settings_divider(self):
+        d = QFrame(); d.setFixedHeight(1)
+        _ss(d, "background-color: #2A2A2A; border: none;")
+        return d
+
+    def _settings_fill_card(self, lay, rows):
+        for n, row in enumerate(rows):
+            lay.addWidget(row)
+            if n < len(rows) - 1: lay.addWidget(self._settings_divider())
+
+    def _settings_button(self, text, primary=False):
+        b = QPushButton(text); b.setFixedHeight(40); b.setMinimumWidth(92)
+        b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        if primary:
+            _ss(b, f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #0B0B0B; border: none; border-radius: 20px; padding: 0 20px; font-size: 14px; font-weight: bold; }} QPushButton:hover {{ background-color: #1ED6B8; }}")
+        else:
+            _ss(b, f"QPushButton {{ background: transparent; color: {TEXT_MUTED}; border: 1.2px solid #3A3A3A; border-radius: 20px; padding: 0 20px; font-size: 14px; }} QPushButton:hover {{ border-color: {TEAL_ACCENT}; color: {TEXT_MAIN}; }}")
+        return b
+
+    def _settings_subpage(self, title, body, expand=False):
+        """Standard sub-page: back arrow + title, then the body."""
+        page = QWidget()
+        lay = QVBoxLayout(page); lay.setContentsMargins(32, 28, 32, 16); lay.setSpacing(20)
+        head = QHBoxLayout(); head.setSpacing(12)
+        back = QPushButton(); back.setFixedSize(40, 40)
+        back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        _ss(back, f"QPushButton {{ background: transparent; border: none; border-radius: 10px; color: {TEXT_MUTED}; font-size: 22px; }} QPushButton:hover {{ background-color: #222222; }}")
+        if not self._settings_arrow.isNull():
+            back.setIcon(QIcon(self._settings_arrow.transformed(QTransform().scale(-1, 1))))
+            back.setIconSize(QSize(20, 20)); back.setProperty("_arrow_back", True)
+        else:
+            back.setText("←")
+        back.clicked.connect(lambda: self.settings_stack.setCurrentIndex(0))
+        lbl = QLabel(title)
+        _ss(lbl, f"color: {TEXT_MAIN}; font-size: 32px; font-weight: bold; background: transparent;")
+        head.addWidget(back); head.addWidget(lbl); head.addStretch()
+        lay.addLayout(head)
+        if expand:
+            lay.addWidget(body, 1)
+        else:
+            lay.addWidget(body); lay.addStretch()
+        return page, lbl
+
+    # ---- page 0: the list ----
+    def _build_settings_main_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page); lay.setContentsMargins(32, 28, 32, 12); lay.setSpacing(20)
+        title = QLabel("Settings")
+        _ss(title, f"color: {TEXT_MAIN}; font-size: 32px; font-weight: bold; background: transparent;")
+        lay.addWidget(title)
+
+        theme = AnimatedComboBox(); theme.setFixedSize(150, 38)
+        theme.addItems(["Default", "Dark", "Light"]); _ss(theme, COMBO_QSS)
+        i = theme.findText(str(self.settings.get("theme", "Default")))
+        theme.setCurrentIndex(i if i >= 0 else 0)
+        theme.currentTextChanged.connect(self._on_theme_changed)
+        self.theme_combo = theme
+
+        arrow = self._settings_arrow
+        spec = [("Interface", "Theme", "top", None, theme, None),
+                ("Downloads", "Change where downloads and trims appear", "middle", arrow, None, 1),
+                ("Update", "yt-dlp  ·  ffmpeg  ·  App", "middle", arrow, None, 2),
+                ("Feedback", "Report a bug  ·  Suggest a feature", "middle", arrow, None, 3),
+                ("About", "Terms and conditions  ·  Change log", "bottom", arrow, None, 4)]
+        rows = []
+        for t, s, pos, arr, ctl, target in spec:
+            row = SettingsRow(t, s, pos, arrow_pixmap=arr, control=ctl)
+            if target is not None:
+                row.clicked.connect(lambda idx=target: self._open_settings_page(idx))
+            rows.append(row)
+        card, cl = self._settings_card()
+        self._settings_fill_card(cl, rows)
+        lay.addWidget(card)
+        lay.addStretch()
+        return page
+
+    def _on_theme_changed(self, text):
+        self.settings["theme"] = text
+        self._save_settings()
+        # deferred: the combo that fired this is itself about to be restyled
+        QTimer.singleShot(0, lambda: self._apply_theme(text))
+
+    # ---- page 1: downloads ----
+    def _build_settings_downloads_page(self):
+        card, cl = self._settings_card()
+        inner = QVBoxLayout(); inner.setContentsMargins(26, 20, 22, 22); inner.setSpacing(6)
+        h = QLabel("Download folder")
+        _ss(h, f"color: {TEXT_MAIN}; font-size: 19px; background: transparent; border: none;")
+        sub = QLabel("Downloads and trims are saved here. Applies to new downloads.")
+        _ss(sub, f"color: {TEXT_MUTED}; font-size: 14px; background: transparent; border: none;")
+        row = QHBoxLayout(); row.setSpacing(10)
         self.dir_input = QLineEdit(self.settings.get("download_dir", str(repo_root / "downloads")))
-        self.dir_input.setStyleSheet(f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_MAIN}; border-radius: 8px; padding: 10px; border: none; font-size: 14px; }}")
-        self.dir_input.setReadOnly(True)
+        self.dir_input.setReadOnly(True); self.dir_input.setFixedHeight(40)
+        _ss(self.dir_input, f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_MAIN}; border-radius: 10px; padding: 0 14px; border: none; font-size: 14px; }}")
+        browse = self._settings_button("Browse", primary=True); browse.clicked.connect(self._settings_choose_dir)
+        reset = self._settings_button("Reset");                 reset.clicked.connect(self._settings_reset_dir)
+        row.addWidget(self.dir_input, 1); row.addWidget(browse); row.addWidget(reset)
+        inner.addWidget(h); inner.addWidget(sub); inner.addSpacing(10); inner.addLayout(row)
+        cl.addLayout(inner)
+        return self._settings_subpage("Downloads", card)[0]
 
-        browse_btn = QPushButton("Browse")
-        browse_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        browse_btn.setStyleSheet(f"QPushButton {{ background-color: {CARD_INNER_BG}; color: {TEXT_MAIN}; border-radius: 8px; padding: 10px 16px; border: 1px solid #444; }} QPushButton:hover {{ background-color: #3A3A3A; }}")
-        
-        def _browse():
-            d = QFileDialog.getExistingDirectory(self, "Select Download Directory", self.dir_input.text())
-            if d:
-                self.dir_input.setText(d)
-                self.settings["download_dir"] = d
-                self._save_settings()
-        
-        browse_btn.clicked.connect(_browse)
+    def _settings_choose_dir(self):
+        start = self.settings.get("download_dir", str(repo_root / "downloads"))
+        d = QFileDialog.getExistingDirectory(self, "Select download folder", start)
+        if d: self._apply_download_dir(os.path.normpath(d))
 
-        dir_layout.addWidget(dir_lbl)
-        dir_layout.addSpacing(10)
-        dir_layout.addWidget(self.dir_input, 1)
-        dir_layout.addWidget(browse_btn)
+    def _settings_reset_dir(self):
+        self._apply_download_dir(str(repo_root / "downloads"))
 
-        layout.addLayout(dir_layout)
-        layout.addStretch()
+    def _apply_download_dir(self, d):
+        try:
+            os.makedirs(d, exist_ok=True)
+            ok = os.access(d, os.W_OK)
+        except OSError:
+            ok = False
+        if not ok:
+            self.toast_mgr.show_toast("Can't write to that folder")
+            return
+        self.settings["download_dir"] = d
+        self._save_settings()
+        self.dir_input.setText(d)
+        self.toast_mgr.show_toast("Download folder updated", icon_pixmap=self._icons.get("check", QIcon()).pixmap(22, 22))
+
+    # ---- page 2: update (read-only versions for now) ----
+    def _build_settings_update_page(self):
+        self._upd_values = {}
+        rows = []
+        for n, (key, name) in enumerate([("yt-dlp", "yt-dlp"), ("ffmpeg", "ffmpeg"), ("app", "Dynamic")]):
+            v = QLabel("…")
+            _ss(v, f"color: {TEXT_MUTED}; font-size: 15px; background: transparent; border: none;")
+            self._upd_values[key] = v
+            rows.append(SettingsRow(name, "", ("top", "middle", "bottom")[n], control=v))
+        card, cl = self._settings_card()
+        self._settings_fill_card(cl, rows)
+        body = QWidget(); bl = QVBoxLayout(body); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(12)
+        bl.addWidget(card)
+        note = QLabel("Installed versions. Updating from inside the app isn't set up yet.")
+        _ss(note, f"color: {TEXT_MUTED}; font-size: 13px; background: transparent;")
+        bl.addWidget(note)
+        return self._settings_subpage("Update", body)[0]
+
+    def _refresh_update_info(self):
+        self._upd_values["yt-dlp"].setText(_pkg_version("yt-dlp") or "Not installed")
+        self._upd_values["app"].setText(APP_VERSION)
+        if not getattr(self, "_ffmpeg_ver_started", False):
+            self._ffmpeg_ver_started = True
+            threading.Thread(target=lambda: self.signals.ffmpeg_version.emit(_ffmpeg_version_text()), daemon=True).start()
+
+    def _on_ffmpeg_version(self, text):
+        if hasattr(self, "_upd_values"): self._upd_values["ffmpeg"].setText(text)
+
+    # ---- page 3: feedback ----
+    def _build_settings_feedback_page(self):
+        arrow = self._settings_arrow
+        bug = SettingsRow("Report a bug", "", "top", arrow_pixmap=arrow)
+        bug.clicked.connect(lambda: self._open_feedback(FEEDBACK_BUG_URL))
+        feat = SettingsRow("Suggest a feature", "", "bottom", arrow_pixmap=arrow)
+        feat.clicked.connect(lambda: self._open_feedback(FEEDBACK_FEATURE_URL))
+        card, cl = self._settings_card()
+        self._settings_fill_card(cl, [bug, feat])
+        return self._settings_subpage("Feedback", card)[0]
+
+    def _open_feedback(self, url):
+        if url: QDesktopServices.openUrl(QUrl(url))
+        else: self.toast_mgr.show_toast("Feedback link isn't set up yet")
+
+    # ---- page 4: about / page 5: text viewer ----
+    def _build_settings_about_page(self):
+        arrow = self._settings_arrow
+        terms = SettingsRow("Terms and conditions", "", "top", arrow_pixmap=arrow)
+        terms.clicked.connect(lambda: self._open_text_page("Terms and conditions", ("TERMS.md", "TERMS.txt", "terms.md", "terms.txt")))
+        log = SettingsRow("Change log", "", "bottom", arrow_pixmap=arrow)
+        log.clicked.connect(lambda: self._open_text_page("Change log", ("CHANGELOG.md", "CHANGELOG.txt", "changelog.md", "changelog.txt")))
+        card, cl = self._settings_card()
+        self._settings_fill_card(cl, [terms, log])
+        return self._settings_subpage("About", card)[0]
+
+    def _build_settings_text_page(self):
+        self._text_view = QPlainTextEdit(); self._text_view.setReadOnly(True)
+        _ss(self._text_view, f"QPlainTextEdit {{ background-color: {CARD_BG}; color: {TEXT_MAIN}; border: 1px solid #2A2A2A; border-radius: 14px; padding: 16px; font-size: 14px; }}")
+        page, self._text_title = self._settings_subpage("", self._text_view, expand=True)
+        # the viewer goes back to About, not to the top-level list
+        back = page.findChild(QPushButton)
+        if back is not None:
+            back.clicked.disconnect()
+            back.clicked.connect(lambda: self.settings_stack.setCurrentIndex(4))
+        return page
+
+    def _open_text_page(self, title, candidates):
+        text = None
+        for name in candidates:
+            p = repo_root / name
+            if p.exists():
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace"); break
+                except OSError:
+                    pass
+        if text is None:
+            text = f"Nothing here yet.\n\nAdd a file named {candidates[1]} next to main.py and its contents will show up here."
+        self._text_title.setText(title)
+        self._text_view.setPlainText(text)
+        self.settings_stack.setCurrentIndex(5)
+
+    # ------------------------------------------------------------------
+    # Theme engine (see theme.py for how colors are mapped)
+    # ------------------------------------------------------------------
+    def _apply_palette(self):
+        P = QPalette.ColorRole
+        pal = QPalette(QApplication.instance().palette())
+        for role, color in ((P.Window, _qc(BG_DARK, "bg")), (P.WindowText, _qc(TEXT_MAIN, "text")),
+                            (P.Base, _qc(CARD_BG, "bg")), (P.AlternateBase, _qc(CARD_INNER_BG, "bg")),
+                            (P.Text, _qc(TEXT_MAIN, "text")), (P.Button, _qc(CARD_BG, "bg")),
+                            (P.ButtonText, _qc(TEXT_MAIN, "text")), (P.ToolTipBase, _qc("#242424", "bg")),
+                            (P.ToolTipText, _qc(TEXT_MAIN, "text")), (P.PlaceholderText, _qc(TEXT_MUTED, "text")),
+                            (P.Highlight, _qc(TEAL_ACCENT)), (P.HighlightedText, _qc("#000000")),
+                            (P.Link, QColor(theme.accent_text()))):
+            pal.setColor(role, color)
+        QApplication.instance().setPalette(pal)
+
+    def _apply_theme(self, setting=None):
+        """Switch theme live. Every widget styled through _ss re-applies its
+        stored source stylesheet in the new mode; icons, painted widgets and
+        the title bar are refreshed explicitly."""
+        setting = setting or self.settings.get("theme", "Default")
+        changed = theme.set_mode(theme.resolve(setting))
+        self._follow_system_theme(str(setting) == "Default")
+        if not changed:
+            return
+        self._apply_palette()
+        self._load_icons()
+        self.setUpdatesEnabled(False)
+        try:
+            widgets = QApplication.instance().allWidgets()
+            for w in widgets:
+                theme.restyle(w)
+            arrow = self._icons.get("arrow-right", QIcon()).pixmap(20, 20)
+            if getattr(self, "_settings_built", False):
+                self._settings_arrow = arrow
+            for w in widgets:
+                if isinstance(w, (FilterTab, SidebarNavButton)):
+                    w.apply_theme()
+                if isinstance(w, SidebarNavButton) and getattr(w, "_icon_name", None):
+                    w.set_icon(self._icons.get(w._icon_name, QIcon()))
+                elif isinstance(w, QPushButton):
+                    n = w.property("_icon_name")
+                    if isinstance(n, str):
+                        w.setIcon(self._icons.get(n, QIcon()))
+                    elif w.property("_arrow_back") and not arrow.isNull():
+                        w.setIcon(QIcon(arrow.transformed(QTransform().scale(-1, 1))))
+                elif isinstance(w, QLabel) and w.property("_arrow") and not arrow.isNull():
+                    w.setPixmap(arrow)
+            self.menu_btn.setIcon(self._icons.get("expand" if self._sidebar_collapsed else "collapse", QIcon()))
+            tw = getattr(self, "trim_widget", None)
+            if tw is not None and hasattr(tw, "apply_theme"):
+                tw.apply_theme()
+            for w in widgets:
+                w.update()
+        finally:
+            self.setUpdatesEnabled(True)
+        self._apply_titlebar_theme()
+
+    def _follow_system_theme(self, enable):
+        """With Theme = Default the app follows Windows' own light/dark setting live."""
+        if not enable or getattr(self, "_sys_theme_hooked", False):
+            return
+        try:
+            from PySide6.QtGui import QGuiApplication
+            QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self._on_system_scheme_changed())
+            self._sys_theme_hooked = True
+        except Exception:
+            pass
+
+    def _on_system_scheme_changed(self):
+        if str(self.settings.get("theme", "Default")) == "Default":
+            QTimer.singleShot(150, lambda: self._apply_theme("Default"))
+
+    def _apply_titlebar_theme(self):
+        """Dark/light native title bar to match (Windows 10 1809+ / 11)."""
+        if sys.platform != "win32":
+            return
+        try:
+            val = ctypes.c_int(0 if theme.is_light() else 1)
+            hwnd = int(self.winId())
+            for attr in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                    break
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)   # nudge a frame redraw
+        except Exception:
+            pass
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._apply_titlebar_theme()
 
     def _toggle_sidebar(self):
         self._sidebar_collapsed = not self._sidebar_collapsed
@@ -1845,6 +2284,9 @@ class DynamicPC(QMainWindow):
             self.trim_layout.addWidget(self.trim_widget)
             self._trim_loaded = True
             
+        if idx == 3 and not getattr(self, "_settings_built", False):
+            self._build_settings_tab()
+
         self.stack.setCurrentIndex(idx)
         for i, btn in enumerate(self.nav_btns):
             btn.set_active(i == idx)
@@ -1862,14 +2304,14 @@ class DynamicPC(QMainWindow):
         hc_layout = QVBoxLayout(self.home_center)
         hc_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_lbl = QLabel("DYNAMIC")
-        self.title_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 68px; font-weight: 300;")
+        _ss(self.title_lbl, f"color: {TEXT_MAIN}; font-size: 68px; font-weight: 300;")
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hc_layout.addWidget(self.title_lbl)
         hc_layout.addSpacing(20)
         self.url_entry = QLineEdit()
         self.url_entry.setPlaceholderText("Enter link...")
         self.url_entry.setFixedSize(600, 54)
-        self.url_entry.setStyleSheet(f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_MAIN}; border-radius: 27px; padding: 0 20px; font-size: 18px; border: none; }}")
+        _ss(self.url_entry, f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_MAIN}; border-radius: 27px; padding: 0 20px; font-size: 18px; border: none; }}")
         self.url_entry.returnPressed.connect(lambda: self._process_link(self.url_entry.text().strip()))
         hc_layout.addWidget(self.url_entry, alignment=Qt.AlignmentFlag.AlignCenter)
         self.home_slot = QWidget()
@@ -1991,7 +2433,7 @@ class DynamicPC(QMainWindow):
         if run_id != self._proc_run_id: return
         self._render_media_card_ui(info, url, thumb_path, fav_path, start_time, end_time)
         dur_s = round(self.proc_overlay._clock.elapsed() / 1000.0)
-        color = ERROR_RED if dur_s >= 60 else TEXT_MAIN
+        color = theme.map_hex(ERROR_RED if dur_s >= 60 else TEXT_MAIN, "text")
         check_pix = self._icons.get("check", QIcon()).pixmap(22, 22)
         self.toast_mgr.show_toast(
             f'Finished in <span style="color: {color};">{dur_s}s</span>',
@@ -2017,7 +2459,7 @@ class DynamicPC(QMainWindow):
         widths/heights/radii/spacing pulled straight from that method) so
         the skeleton never has to guess at the card's shape."""
         outer = QFrame()
-        outer.setStyleSheet("QFrame { border: none; }")
+        _ss(outer, "QFrame { border: none; }")
         outer.setMaximumWidth(720)
         o_layout = QVBoxLayout(outer)
         o_layout.setContentsMargins(0, 0, 0, 0)
@@ -2102,7 +2544,7 @@ class DynamicPC(QMainWindow):
         site = _site_name(url)
 
         outer = QFrame()
-        outer.setStyleSheet("QFrame { border: none; }")
+        _ss(outer, "QFrame { border: none; }")
         outer.setMaximumWidth(720)
         
         o_layout = QVBoxLayout(outer)
@@ -2111,14 +2553,14 @@ class DynamicPC(QMainWindow):
 
         thumb_lbl = QLabel()
         thumb_lbl.setFixedSize(720, 405) 
-        thumb_lbl.setStyleSheet(f"background-color: {CARD_INNER_BG}; border-radius: 8px;")
+        _ss(thumb_lbl, f"background-color: {CARD_INNER_BG}; border-radius: 8px;")
         if thumb_path and os.path.exists(thumb_path):
             pix = QPixmap(thumb_path).scaled(720, 405, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
             thumb_lbl.setPixmap(get_rounded_pixmap(pix, 14))
         o_layout.addWidget(thumb_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
 
         t_lbl = QLabel(title_text)
-        t_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 34px; font-weight: normal; border: none;")
+        _ss(t_lbl, f"color: {TEXT_MAIN}; font-size: 34px; font-weight: normal; border: none;")
         t_lbl.setWordWrap(True)
         o_layout.addWidget(t_lbl)
 
@@ -2126,28 +2568,28 @@ class DynamicPC(QMainWindow):
         meta_layout.setSpacing(15)
         
         c_lbl = QLabel(channel_text)
-        c_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 16px; border: none;")
+        _ss(c_lbl, f"color: {TEXT_MAIN}; font-size: 16px; border: none;")
         meta_layout.addWidget(c_lbl)
 
         d_lbl = QLabel(dur_str)
-        d_lbl.setStyleSheet(f"color: {'#FF5555' if is_live else TEXT_MAIN}; font-size: 16px; font-weight: {'bold' if is_live else 'normal'}; border: none;")
+        _ss(d_lbl, f"color: {'#FF5555' if is_live else TEXT_MAIN}; font-size: 16px; font-weight: {'bold' if is_live else 'normal'}; border: none;")
         meta_layout.addWidget(d_lbl)
         
         site_layout = QHBoxLayout()
         site_layout.setSpacing(6)
         if fav_path and os.path.exists(fav_path):
             fav_lbl = QLabel()
-            fav_lbl.setStyleSheet("border: none; background: transparent;")
+            _ss(fav_lbl, "border: none; background: transparent;")
             fav_lbl.setPixmap(QPixmap(fav_path).scaled(18, 18, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             site_layout.addWidget(fav_lbl)
         else:
             site_icon = QLabel("▶" if "Youtube" in site else "🌐")
-            site_icon.setStyleSheet(f"color: {'#FF0000' if 'Youtube' in site else TEAL_ACCENT}; font-size: 18px; border: none;")
+            _ss(site_icon, f"color: {'#FF0000' if 'Youtube' in site else TEAL_ACCENT}; font-size: 18px; border: none;")
             site_layout.addWidget(site_icon)
             
         site_lbl = QLabel(site)
         site_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        site_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 16px; border: none;")
+        _ss(site_lbl, f"color: {TEXT_MAIN}; font-size: 16px; border: none;")
         site_lbl.mousePressEvent = lambda e: self._open_qurl(QUrl(url))
         
         site_layout.addWidget(site_lbl)
@@ -2161,7 +2603,7 @@ class DynamicPC(QMainWindow):
         btn_layout.setSpacing(15)
 
         seg_frame = QFrame()
-        seg_frame.setStyleSheet("QFrame { background-color: #222222; border-radius: 8px; }")
+        _ss(seg_frame, "QFrame { background-color: #222222; border-radius: 8px; }")
         seg_frame.setFixedHeight(38)
         seg_layout = QHBoxLayout(seg_frame)
         seg_layout.setContentsMargins(4, 4, 4, 4)
@@ -2178,13 +2620,13 @@ class DynamicPC(QMainWindow):
         def update_btn_styles(mode):
             act = f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }}"
             inact = f"QPushButton {{ background-color: transparent; color: {TEXT_MUTED}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }} QPushButton:hover {{ background-color: #2A2A2A; }}"
-            if mode == "Video": bv.setStyleSheet(act); ba.setStyleSheet(inact)
-            else: bv.setStyleSheet(inact); ba.setStyleSheet(act)
+            if mode == "Video": _ss(bv, act); _ss(ba, inact)
+            else: _ss(bv, inact); _ss(ba, act)
         
         if audio_only:
             bv.setDisabled(True)
-            bv.setStyleSheet("QPushButton { background-color: transparent; color: #444; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }")
-            ba.setStyleSheet(f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }}")
+            _ss(bv, "QPushButton { background-color: transparent; color: #444; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }")
+            _ss(ba, f"QPushButton {{ background-color: #333333; color: {TEAL_ACCENT}; font-size: 14px; border-radius: 6px; border: none; padding: 0 15px; }}")
         else: update_btn_styles("Video")
         
         seg_layout.addWidget(bv)
@@ -2194,7 +2636,7 @@ class DynamicPC(QMainWindow):
         qm = AnimatedComboBox()
         qm.setFixedHeight(38)
         qm.setMinimumWidth(160)
-        qm.setStyleSheet(f"""
+        _ss(qm, f"""
             QComboBox {{ 
                 background-color: #1A1A1A; 
                 color: #FFFFFF; 
@@ -2240,7 +2682,7 @@ class DynamicPC(QMainWindow):
         btn_cancel.setFixedHeight(38)
         btn_cancel.setMinimumWidth(100)
         btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        btn_cancel.setStyleSheet(f"QPushButton {{ background-color: transparent; border: 1px solid #777777; color: {TEXT_MAIN}; font-size: 14px; border-radius: 19px; }} QPushButton:hover {{ background-color: #222222; }}")
+        _ss(btn_cancel, f"QPushButton {{ background-color: transparent; border: 1px solid #777777; color: {TEXT_MAIN}; font-size: 14px; border-radius: 19px; }} QPushButton:hover {{ background-color: #222222; }}")
         btn_layout.addWidget(btn_cancel)
 
         btn_dl = QPushButton("Download")
@@ -2248,9 +2690,9 @@ class DynamicPC(QMainWindow):
         btn_dl.setMinimumWidth(120)
         btn_dl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         if is_live: 
-            btn_dl.setStyleSheet("QPushButton { background-color: #222222; color: #666666; font-size: 14px; font-weight: bold; border-radius: 19px; border: 1px solid #333333; } QPushButton:hover { background-color: #262626; }")
+            _ss(btn_dl, "QPushButton { background-color: #222222; color: #666666; font-size: 14px; font-weight: bold; border-radius: 19px; border: 1px solid #333333; } QPushButton:hover { background-color: #262626; }")
         else: 
-            btn_dl.setStyleSheet(f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #000000; font-size: 14px; font-weight: bold; border-radius: 19px; border: none; }} QPushButton:hover {{ background-color: #00A892; }}")
+            _ss(btn_dl, f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #000000; font-size: 14px; font-weight: bold; border-radius: 19px; border: none; }} QPushButton:hover {{ background-color: #00A892; }}")
         btn_layout.addWidget(btn_dl)
 
         o_layout.addLayout(btn_layout)
@@ -2310,7 +2752,7 @@ class DynamicPC(QMainWindow):
         wrap_v = QVBoxLayout(wrapper); wrap_v.setContentsMargins(0, 0, 0, 14); wrap_v.setSpacing(0)
 
         card = QFrame(); card.setFixedHeight(180)
-        card.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border: 1px solid #333333; border-radius: 14px; }}")
+        _ss(card, f"QFrame {{ background-color: {CARD_BG}; border: 1px solid #333333; border-radius: 14px; }}")
         shadow = QGraphicsDropShadowEffect(card)
         shadow.setBlurRadius(24); shadow.setColor(QColor(0, 0, 0, 130)); shadow.setOffset(0, 6)
         card.setGraphicsEffect(shadow)
@@ -2347,12 +2789,12 @@ class DynamicPC(QMainWindow):
     def _build_downloads_tab(self):
         main_layout = QVBoxLayout(self.tab_dl); main_layout.setContentsMargins(0, 0, 0, 0); main_layout.setSpacing(0)
         top_container = QWidget(); top_layout = QVBoxLayout(top_container); top_layout.setContentsMargins(32, 28, 32, 12); top_layout.setSpacing(16)
-        lbl = QLabel("Downloads"); lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 32px; font-weight: bold;"); top_layout.addWidget(lbl)
+        lbl = QLabel("Downloads"); _ss(lbl, f"color: {TEXT_MAIN}; font-size: 32px; font-weight: bold;"); top_layout.addWidget(lbl)
         filters = ["All", "Active", "Paused", "Done", "Failed"]
         self.filter_tab_bar = FilterTabBar(filters); self.filter_tab_bar.filter_changed.connect(self._on_filter_changed)
         top_layout.addWidget(self.filter_tab_bar, alignment=Qt.AlignmentFlag.AlignLeft)
         main_layout.addWidget(top_container)
-        self.scroll = ModernScrollArea(); self.scroll_content = QWidget(); self.scroll_content.setStyleSheet("background-color: transparent;")
+        self.scroll = ModernScrollArea(); self.scroll_content = QWidget(); _ss(self.scroll_content, "background-color: transparent;")
         self.scroll_layout = QVBoxLayout(self.scroll_content); self.scroll_layout.setContentsMargins(32, 10, 32, 16); self.scroll_layout.setSpacing(16); self.scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll.setWidget(self.scroll_content); main_layout.addWidget(self.scroll, 1)
         self._dl_empty_label = None
@@ -2370,7 +2812,7 @@ class DynamicPC(QMainWindow):
         for item in reversed(self._dl_items):
             self.scroll_layout.addWidget(self._build_dl_card_widget(item))
         self._dl_empty_label = QLabel("No downloads here")
-        self._dl_empty_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 15px;")
+        _ss(self._dl_empty_label, f"color: {TEXT_MUTED}; font-size: 15px;")
         self._dl_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_layout.addWidget(self._dl_empty_label)
         self.scroll_layout.addStretch()
@@ -2406,81 +2848,81 @@ class DynamicPC(QMainWindow):
 
     def _build_dl_card_widget(self, item: DownloadItem):
         card = QFrame(); card.setFixedHeight(180)
-        card.setStyleSheet(f"QFrame {{ background-color: {CARD_BG}; border: 1px solid #2A2A2A; border-radius: 14px; }}")
+        _ss(card, f"QFrame {{ background-color: {CARD_BG}; border: 1px solid #2A2A2A; border-radius: 14px; }}")
         main_h = QHBoxLayout(card); main_h.setContentsMargins(16, 16, 16, 16); main_h.setSpacing(20)
         thumb_lbl = QLabel(); thumb_lbl.setFixedSize(240, 135)
-        thumb_lbl.setStyleSheet(f"background-color: {CARD_INNER_BG}; border-radius: 14px; border: none;")
+        _ss(thumb_lbl, f"background-color: {CARD_INNER_BG}; border-radius: 14px; border: none;")
         if item.thumb_path and os.path.exists(item.thumb_path):
             pix = QPixmap(item.thumb_path).scaled(240, 135, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
             thumb_lbl.setPixmap(get_rounded_pixmap(pix, 14))
         main_h.addWidget(thumb_lbl)
         right_v = QVBoxLayout(); right_v.setContentsMargins(0, 0, 0, 0); right_v.setSpacing(4)
         title_h = QHBoxLayout()
-        title_lbl = QLabel(item.title); title_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 20px; font-weight: bold; border: none;"); title_lbl.setWordWrap(True)
+        title_lbl = QLabel(item.title); _ss(title_lbl, f"color: {TEXT_MAIN}; font-size: 20px; font-weight: bold; border: none;"); title_lbl.setWordWrap(True)
         title_h.addWidget(title_lbl, 1)
-        trash_btn = QPushButton(); trash_btn.setIcon(self._icons.get("trash", QIcon())); trash_btn.setIconSize(QSize(22, 22)); trash_btn.setFixedSize(32, 32); trash_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        trash_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; }} QPushButton:hover {{ background: #2A1A1A; border-radius: 8px; }}")
+        trash_btn = QPushButton(); trash_btn.setIcon(self._icons.get("trash", QIcon())); trash_btn.setProperty("_icon_name", "trash"); trash_btn.setIconSize(QSize(22, 22)); trash_btn.setFixedSize(32, 32); trash_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        _ss(trash_btn, f"QPushButton {{ background: transparent; border: none; }} QPushButton:hover {{ background: #2A1A1A; border-radius: 8px; }}")
         
         def _trash_click():
             if item._trash_ready:
                 if item in self._dl_items: self._dl_items.remove(item)
                 item._cancelled = True; self._dl_item_removed(item)
             else:
-                item._trash_ready = True; trash_btn.setIcon(self._icons.get("trash red", QIcon()))
+                item._trash_ready = True; trash_btn.setIcon(self._icons.get("trash red", QIcon())); trash_btn.setProperty("_icon_name", "trash red")
                 QTimer.singleShot(3000, lambda: _reset_trash())
         def _reset_trash():
             item._trash_ready = False
-            try: trash_btn.setIcon(self._icons.get("trash", QIcon()))
+            try: trash_btn.setIcon(self._icons.get("trash", QIcon())); trash_btn.setProperty("_icon_name", "trash")
             except RuntimeError: pass
         trash_btn.clicked.connect(_trash_click); title_h.addWidget(trash_btn); right_v.addLayout(title_h)
         meta_h = QHBoxLayout()
-        ch_lbl = QLabel(item.channel); ch_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 14px; border: none;"); meta_h.addWidget(ch_lbl)
-        dur_lbl = QLabel(f" •  {item.duration_str}"); dur_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 14px; border: none;"); meta_h.addWidget(dur_lbl)
-        dot_lbl = QLabel(" • "); dot_lbl.setStyleSheet(f"color: #DDDDDD; font-size: 14px; border: none;"); meta_h.addWidget(dot_lbl)
+        ch_lbl = QLabel(item.channel); _ss(ch_lbl, f"color: {TEXT_MAIN}; font-size: 14px; border: none;"); meta_h.addWidget(ch_lbl)
+        dur_lbl = QLabel(f" •  {item.duration_str}"); _ss(dur_lbl, f"color: {TEXT_MAIN}; font-size: 14px; border: none;"); meta_h.addWidget(dur_lbl)
+        dot_lbl = QLabel(" • "); _ss(dot_lbl, f"color: #DDDDDD; font-size: 14px; border: none;"); meta_h.addWidget(dot_lbl)
         if item.fav_path and os.path.exists(item.fav_path):
-            fav_lbl = QLabel(); fav_lbl.setStyleSheet("border: none; background: transparent;")
+            fav_lbl = QLabel(); _ss(fav_lbl, "border: none; background: transparent;")
             fav_lbl.setPixmap(QPixmap(item.fav_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             meta_h.addWidget(fav_lbl)
-        site_lbl = QLabel(item.site_name); site_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); site_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 14px; border: none;"); site_lbl.mousePressEvent = lambda e, u=item.url: self._open_qurl(QUrl(u)); meta_h.addWidget(site_lbl)
+        site_lbl = QLabel(item.site_name); site_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); _ss(site_lbl, f"color: {TEXT_MUTED}; font-size: 14px; border: none;"); site_lbl.mousePressEvent = lambda e, u=item.url: self._open_qurl(QUrl(u)); meta_h.addWidget(site_lbl)
         meta_h.addStretch(); right_v.addLayout(meta_h); right_v.addStretch()
 
         if item.status == "failed":
-            err_frame = QFrame(); err_frame.setStyleSheet(f"background-color: {ERROR_BG}; border: 1px solid #4A2020; border-radius: 8px;")
+            err_frame = QFrame(); _ss(err_frame, f"background-color: {ERROR_BG}; border: 1px solid #4A2020; border-radius: 8px;")
             err_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             err_layout = QVBoxLayout(err_frame); err_layout.setContentsMargins(10, 6, 10, 6)
             clean_err = (item.error_msg or "Unknown error").strip().replace("\n", " ")
             if len(clean_err) > 130: clean_err = clean_err[:130] + "..."
-            err_lbl = QLabel(clean_err); err_lbl.setWordWrap(True); err_lbl.setMaximumWidth(520); err_lbl.setStyleSheet("color: #FF8888; font-size: 11px; font-family: sans-serif; border: none;"); err_layout.addWidget(err_lbl)
+            err_lbl = QLabel(clean_err); err_lbl.setWordWrap(True); err_lbl.setMaximumWidth(520); _ss(err_lbl, "color: #FF8888; font-size: 11px; border: none;"); err_layout.addWidget(err_lbl)
             right_v.addWidget(err_frame, alignment=Qt.AlignmentFlag.AlignLeft)
             retry_h = QHBoxLayout(); retry_h.setContentsMargins(0, 4, 0, 0)
-            retry_btn = QPushButton(" Retry"); retry_btn.setIcon(self._icons.get("retry", QIcon())); retry_btn.setIconSize(QSize(18, 18)); retry_btn.setFixedSize(90, 32); retry_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); retry_btn.setStyleSheet(f"QPushButton {{ background-color: #2A2A2A; color: {TEXT_MAIN}; font-weight: bold; border-radius: 16px; border: none; }} QPushButton:hover {{ background-color: #333333; }}")
+            retry_btn = QPushButton(" Retry"); retry_btn.setIcon(self._icons.get("retry", QIcon())); retry_btn.setProperty("_icon_name", "retry"); retry_btn.setIconSize(QSize(18, 18)); retry_btn.setFixedSize(90, 32); retry_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); _ss(retry_btn, f"QPushButton {{ background-color: #2A2A2A; color: {TEXT_MAIN}; font-weight: bold; border-radius: 16px; border: none; }} QPushButton:hover {{ background-color: #333333; }}")
             def _retry(): item.status, item.error_msg, item.percent = "active", "", 0.0; self._start_download(item); self._refresh_single_card(item)
             retry_btn.clicked.connect(_retry); retry_h.addWidget(retry_btn); retry_h.addStretch(); right_v.addLayout(retry_h)
         else:
             prog_h = QHBoxLayout(); prog_h.setSpacing(12)
             if item.status != "done":
-                ctrl_btn = QPushButton(); ctrl_btn.setFixedSize(36, 36); ctrl_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); ctrl_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; }} QPushButton:hover {{ background: #252525; border-radius: 8px; }}")
+                ctrl_btn = QPushButton(); ctrl_btn.setFixedSize(36, 36); ctrl_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); _ss(ctrl_btn, f"QPushButton {{ background: transparent; border: none; }} QPushButton:hover {{ background: #252525; border-radius: 8px; }}")
                 if item.status == "active":
-                    ctrl_btn.setIcon(self._icons.get("pause", QIcon())); ctrl_btn.setIconSize(QSize(24, 24))
+                    ctrl_btn.setIcon(self._icons.get("pause", QIcon())); ctrl_btn.setProperty("_icon_name", "pause"); ctrl_btn.setIconSize(QSize(24, 24))
                     def _pause():
                         if item.duration_str == "LIVE": self.toast_mgr.show_toast("Download cannot be paused"); return
                         item.status = "paused"; item._cancelled = True; item.speed, item.eta = "--", "--"; self._refresh_single_card(item)
                     ctrl_btn.clicked.connect(_pause)
                 elif item.status == "paused":
-                    ctrl_btn.setIcon(self._icons.get("play", QIcon())); ctrl_btn.setIconSize(QSize(24, 24))
+                    ctrl_btn.setIcon(self._icons.get("play", QIcon())); ctrl_btn.setProperty("_icon_name", "play"); ctrl_btn.setIconSize(QSize(24, 24))
                     def _resume(): item.status = "active"; item._cancelled = False; item.speed, item.eta = "Resuming...", "--"; self._start_download(item); self._refresh_single_card(item)
                     ctrl_btn.clicked.connect(_resume)
                 prog_h.addWidget(ctrl_btn)
             bar_v = QVBoxLayout(); bar_v.setSpacing(6)
             if item.status != "done":
                 pb = QProgressBar(); pb.setFixedHeight(4); pb.setTextVisible(False); pb.setMaximum(1000); pb.setValue(int(item.percent * 1000))
-                pb.setStyleSheet(f"QProgressBar {{ background-color: #333333; border: none; border-radius: 2px; }} QProgressBar::chunk {{ background-color: {TEAL_ACCENT}; border-radius: 2px; }}")
+                _ss(pb, f"QProgressBar {{ background-color: #333333; border: none; border-radius: 2px; }} QProgressBar::chunk {{ background-color: {TEAL_ACCENT}; border-radius: 2px; }}")
                 bar_v.addWidget(pb); card.prog_bar = pb
             stats_h = QHBoxLayout()
             dl_str, tot_str, pct_val, spd, eta = item.downloaded or "0MB", item.total_size or "Unknown", item.percent * 100, item.speed or "0Mb/s", item.eta or "--:--"
             stat_txt = "Download complete" if item.status == "done" else (f"Paused - {int(item.percent*100)}%" if item.status == "paused" else f"{dl_str} / {tot_str} ({pct_val:.1f}%)   {spd}   ETA: {eta}")
-            stat_lbl = QLabel(stat_txt); stat_lbl.setStyleSheet(f"color: {TEAL_ACCENT if item.status == 'done' else (TEXT_MAIN if item.status == 'active' else TEXT_MUTED)}; font-size: 12px; font-weight: {'bold' if item.status == 'done' else 'normal'}; border: none;"); stats_h.addWidget(stat_lbl); card.stat_lbl = stat_lbl
-            path_lbl = QLabel(item.out_dir); path_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); path_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px; border: none;"); path_lbl.mousePressEvent = lambda e, it=item: self._reveal_in_explorer(it); stats_h.addWidget(path_lbl, alignment=Qt.AlignmentFlag.AlignRight)
+            stat_lbl = QLabel(stat_txt); _ss(stat_lbl, f"color: {TEAL_ACCENT if item.status == 'done' else (TEXT_MAIN if item.status == 'active' else TEXT_MUTED)}; font-size: 12px; font-weight: {'bold' if item.status == 'done' else 'normal'}; border: none;"); stats_h.addWidget(stat_lbl); card.stat_lbl = stat_lbl
+            path_lbl = QLabel(item.out_dir); path_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor)); _ss(path_lbl, f"color: {TEXT_MUTED}; font-size: 12px; border: none;"); path_lbl.mousePressEvent = lambda e, it=item: self._reveal_in_explorer(it); stats_h.addWidget(path_lbl, alignment=Qt.AlignmentFlag.AlignRight)
             bar_v.addLayout(stats_h); prog_h.addLayout(bar_v); right_v.addLayout(prog_h)
 
         main_h.addLayout(right_v)
@@ -2565,8 +3007,8 @@ def configure_app(app):
     app._ctx_menu_blocker = ctx_menu_blocker  # keep a Python ref alive
 
     palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(TEAL_ACCENT))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, _qc(TEAL_ACCENT))
+    palette.setColor(QPalette.ColorRole.HighlightedText, _qc("#000000"))
     app.setPalette(palette)
 
 

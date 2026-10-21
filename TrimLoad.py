@@ -20,7 +20,9 @@ from PySide6.QtCore import (Qt, QUrl, Signal, QPointF, QRectF, QLineF, QObject, 
                           QPropertyAnimation, QSequentialAnimationGroup, QParallelAnimationGroup, 
                           QPoint, QEasingCurve, QEvent, QRect, QElapsedTimer, QVariantAnimation)
 from PySide6.QtGui import (QFont, QPainter, QColor, QPen, QCursor, QPixmap, QIcon, QDesktopServices,
-                         QPainterPath, QBrush, QLinearGradient, QRadialGradient, QFontMetrics, QPalette)
+                         QPainterPath, QBrush, QLinearGradient, QRadialGradient, QFontMetrics, QPalette, QFontDatabase)
+import theme
+from theme import ss as _ss, qc as _qc
 
 try:
     from PySide6.QtSvgWidgets import QSvgWidget
@@ -97,6 +99,37 @@ class GlobalContextMenuBlocker(QObject):
         if event.type() == QEvent.Type.ContextMenu and isinstance(obj, (QLineEdit, QScrollBar)):
             return True
         return super().eventFilter(obj, event)
+
+
+_MONO_FAMILY = None
+def _mono_family():
+    """A fixed-width family that is actually installed. Asking Qt for a
+    family that doesn't exist ("monospace" is a CSS generic, not a Windows
+    font) makes it load font files to resolve the name - measured at
+    ~3.7 s in the startup profile."""
+    global _MONO_FAMILY
+    if _MONO_FAMILY is None:
+        for fam in ("Consolas", "Cascadia Mono", "Courier New"):
+            if QFontDatabase.hasFamily(fam):
+                _MONO_FAMILY = fam
+                break
+        else:
+            _MONO_FAMILY = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont).family()
+    return _MONO_FAMILY
+
+
+def _tint_overlay(alpha_dark, alpha_light):
+    """Translucent fill used for hover/chip tints: white-on-dark, black-on-light."""
+    return QColor(0, 0, 0, alpha_light) if theme.is_light() else QColor(255, 255, 255, alpha_dark)
+
+
+def _unused_hover_overlay():
+    return _tint_overlay(18, 12)
+
+
+def _white_sheen(alpha_dark, alpha_light):
+    """The moving highlight on skeleton blocks: faint on dark, strong on light."""
+    return QColor(255, 255, 255, alpha_light if theme.is_light() else alpha_dark)
 
 
 def _is_audio_only_url(url):
@@ -323,7 +356,7 @@ class LoadingOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setStyleSheet("background-color: rgba(0, 0, 0, 160); border-radius: 12px")
+        _ss(self, "background-color: rgba(0, 0, 0, 160); border-radius: 12px")
         
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -339,7 +372,7 @@ class LoadingOverlay(QWidget):
         else:
             self.spinner = None
             lbl = QLabel("Loading...")
-            lbl.setStyleSheet(f"color: {TEAL_ACCENT}; font-size: 16px; font-weight: bold;")
+            _ss(lbl, f"color: {TEAL_ACCENT}; font-size: 16px; font-weight: bold;")
             layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.hide()
@@ -365,7 +398,7 @@ class StandaloneToastWidget(QFrame):
     def __init__(self, message, parent=None, icon_pixmap=None, rich_text=False):
         super().__init__(parent)
         self.setFixedSize(290, 48)
-        self.setStyleSheet("QFrame { background-color: #242424; border: 1px solid #333333; border-radius: 12px; }")
+        _ss(self, "QFrame { background-color: #242424; border: 1px solid #333333; border-radius: 12px; }")
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(16)
         shadow.setColor(QColor(0, 0, 0, 160))
@@ -380,22 +413,22 @@ class StandaloneToastWidget(QFrame):
             icon_lbl = QLabel()
             icon_lbl.setFixedSize(22, 22)
             icon_lbl.setPixmap(icon_pixmap)
-            icon_lbl.setStyleSheet("background: transparent; border: none;")
+            _ss(icon_lbl, "background: transparent; border: none;")
         else:
             icon_lbl = QLabel("✕")
-            icon_lbl.setStyleSheet("color: #FF5555; font-size: 15px; font-weight: bold; border: none; background: transparent;")
+            _ss(icon_lbl, "color: #FF5555; font-size: 15px; font-weight: bold; border: none; background: transparent;")
         layout.addWidget(icon_lbl)
         
         msg_lbl = QLabel(message)
         if rich_text:
             msg_lbl.setTextFormat(Qt.TextFormat.RichText)
-        msg_lbl.setStyleSheet("color: #FFFFFF; font-size: 13px; font-weight: 500; border: none; background: transparent;")
+        _ss(msg_lbl, "color: #FFFFFF; font-size: 13px; font-weight: 500; border: none; background: transparent;")
         layout.addWidget(msg_lbl, 1)
         
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(22, 22)
         close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        close_btn.setStyleSheet("QPushButton { color: #888888; font-size: 13px; font-weight: bold; border: none; background: transparent; } QPushButton:hover { color: #FFFFFF; }")
+        _ss(close_btn, "QPushButton { color: #888888; font-size: 13px; font-weight: bold; border: none; background: transparent; } QPushButton:hover { color: #FFFFFF; }")
         close_btn.clicked.connect(self.close_toast)
         layout.addWidget(close_btn)
         
@@ -472,7 +505,7 @@ class AspectRatioLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pix = None
-        self.setStyleSheet("background-color: #000000;")
+        _ss(self, "background-color: #000000;")
         
     def setPixmap(self, p):
         self.pix = p
@@ -526,47 +559,47 @@ class TrimRangeSlider(QWidget):
         if usable_w <= 0 or self.duration <= 0:
             return
 
-        painter.setPen(QPen(QColor("#3A3A3A"), 4))
+        painter.setPen(QPen(_qc("#3A3A3A"), 4))
         painter.drawLine(QLineF(margin, cy, w - margin, cy))
 
         start_x = margin + (self.start_time / self.duration) * usable_w
         end_x = margin + (self.end_time / self.duration) * usable_w
 
-        painter.setPen(QPen(QColor(TEAL_ACCENT), 4))
+        painter.setPen(QPen(_qc(TEAL_ACCENT), 4))
         painter.drawLine(QLineF(start_x, cy, end_x, cy))
 
         handle_w = 12
         handle_h = 22
 
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(TEAL_ACCENT))
+        painter.setBrush(_qc(TEAL_ACCENT))
         start_rect = QRectF(start_x - handle_w / 2, cy - handle_h / 2, handle_w, handle_h)
         painter.drawRoundedRect(start_rect, handle_w / 2, handle_w / 2)
         
-        painter.setPen(QPen(QColor("#121212"), 2))
+        painter.setPen(QPen(_qc("#121212"), 2))
         painter.drawLine(QLineF(start_x, cy - 4, start_x, cy + 4))
 
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(TEAL_ACCENT))
+        painter.setBrush(_qc(TEAL_ACCENT))
         end_rect = QRectF(end_x - handle_w / 2, cy - handle_h / 2, handle_w, handle_h)
         painter.drawRoundedRect(end_rect, handle_w / 2, handle_w / 2)
         
-        painter.setPen(QPen(QColor("#121212"), 2))
+        painter.setPen(QPen(_qc("#121212"), 2))
         painter.drawLine(QLineF(end_x, cy - 4, end_x, cy + 4))
 
         pos_x = margin + (self.current_time / self.duration) * usable_w
         top_y = cy - 22
 
-        painter.setPen(QPen(QColor(TEAL_ACCENT), 2))
+        painter.setPen(QPen(_qc(TEAL_ACCENT), 2))
         painter.drawLine(QLineF(pos_x, cy, pos_x, top_y))
 
-        glow_color = QColor(TEAL_ACCENT)
+        glow_color = _qc(TEAL_ACCENT)
         glow_color.setAlpha(70)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(glow_color)
         painter.drawEllipse(QPointF(pos_x, top_y), 8, 8)
 
-        painter.setBrush(QColor(TEAL_ACCENT))
+        painter.setBrush(_qc(TEAL_ACCENT))
         painter.drawEllipse(QPointF(pos_x, top_y), 4.5, 4.5)
 
     def mousePressEvent(self, event):
@@ -725,19 +758,19 @@ class ProcessingOverlay(QWidget):
     def _build_buttons(self):
         self._btn_cancel = QPushButton("Cancel", self)
         self._btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_cancel.setStyleSheet(self._pill_style(filled=False))
+        _ss(self._btn_cancel, self._pill_style(filled=False))
         self._btn_cancel.clicked.connect(self.cancel_requested.emit)
         self._cancel_fx = self._fade_with_overlay(self._btn_cancel)
 
         self._btn_retry = QPushButton("Try Again", self)
         self._btn_retry.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_retry.setStyleSheet(self._pill_style(filled=True))
+        _ss(self._btn_retry, self._pill_style(filled=True))
         self._btn_retry.clicked.connect(self.retry_requested.emit)
         self._retry_fx = self._fade_with_overlay(self._btn_retry)
 
         self._btn_log = QPushButton("Error Log", self)
         self._btn_log.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._btn_log.setStyleSheet(self._pill_style(filled=False))
+        _ss(self._btn_log, self._pill_style(filled=False))
         self._btn_log.clicked.connect(self._toggle_log)
         self._log_btn_fx = self._fade_with_overlay(self._btn_log)
 
@@ -746,13 +779,13 @@ class ProcessingOverlay(QWidget):
 
     def _build_log_panel(self):
         self._log_panel = QFrame(self)
-        self._log_panel.setStyleSheet("QFrame { background-color: #161616; border: 1px solid #2E2E2E; border-radius: 10px; }")
+        _ss(self._log_panel, "QFrame { background-color: #161616; border: 1px solid #2E2E2E; border-radius: 10px; }")
         lay = QVBoxLayout(self._log_panel)
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(8)
         header = QHBoxLayout()
         title = QLabel("Error details")
-        title.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+        _ss(title, f"color: {TEXT_MUTED}; font-size: 11px; font-weight: bold; border: none; background: transparent;")
         header.addWidget(title)
         header.addStretch()
         self._btn_copy = QPushButton("Copy")
@@ -763,14 +796,14 @@ class ProcessingOverlay(QWidget):
                                     f"QPushButton:hover {{ border-color: {TEAL_ACCENT}; color: {TEXT_MAIN}; }}")
         self._copy_style_done = (f"QPushButton {{ background: transparent; border: 1px solid {TEAL_ACCENT}; border-radius: 12px; "
                                   f"color: {TEAL_ACCENT}; font-size: 11px; font-weight: bold; }}")
-        self._btn_copy.setStyleSheet(self._copy_style_normal)
+        _ss(self._btn_copy, self._copy_style_normal)
         self._btn_copy.clicked.connect(self._copy_error_text)
         header.addWidget(self._btn_copy)
         lay.addLayout(header)
         self._log_text = QPlainTextEdit()
         self._log_text.setReadOnly(True)
-        self._log_text.setStyleSheet(f"QPlainTextEdit {{ background: transparent; border: none; color: {ERROR_RED}; "
-                                       f"font-family: Consolas, monospace; font-size: 11px; }}")
+        _ss(self._log_text, f"QPlainTextEdit {{ background: transparent; border: none; color: {ERROR_RED}; "
+                                       f"font-family: '{_mono_family()}'; font-size: 11px; }}")
         lay.addWidget(self._log_text, 1)
         self._log_panel.hide()
         self._log_fx = self._fade_with_overlay(self._log_panel)
@@ -782,12 +815,12 @@ class ProcessingOverlay(QWidget):
     def _copy_error_text(self):
         QApplication.clipboard().setText(self._error_text)
         self._btn_copy.setText("Copied")
-        self._btn_copy.setStyleSheet(self._copy_style_done)
+        _ss(self._btn_copy, self._copy_style_done)
         QTimer.singleShot(1500, self._reset_copy_button)
 
     def _reset_copy_button(self):
         self._btn_copy.setText("Copy")
-        self._btn_copy.setStyleSheet(self._copy_style_normal)
+        _ss(self._btn_copy, self._copy_style_normal)
 
     def _toggle_log(self):
         self._log_open = not self._log_open
@@ -1035,14 +1068,14 @@ class ProcessingOverlay(QWidget):
         headline = "Couldn't process link" if failed else self.STEPS[idx][1]
         detail = "Check the link and try again" if failed else self.STEPS[idx][3].format(host=self._host)
         hf = self._font(38, QFont.Weight.Light)
-        p.setFont(hf); p.setPen(QColor(TEXT_MAIN))
+        p.setFont(hf); p.setPen(_qc(TEXT_MAIN))
         p.drawText(QRectF(cx - 390, cy - 96 + dy, 780, 56), Qt.AlignmentFlag.AlignCenter, headline)
         if not failed and idx < len(self.STEPS) - 1:
             tw = QFontMetrics(hf).horizontalAdvance(headline)
             n = int(now / 380) % 4
-            p.setPen(QColor(TEAL_ACCENT))
+            p.setPen(_qc(TEAL_ACCENT))
             p.drawText(QRectF(cx + tw / 2 + 4, cy - 96 + dy, 60, 56), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "." * n)
-        p.setFont(self._font(14)); p.setPen(QColor(ERROR_RED if failed else TEXT_MUTED))
+        p.setFont(self._font(14)); p.setPen(_qc(ERROR_RED if failed else TEXT_MUTED))
         fm = QFontMetrics(p.font())
         p.drawText(QRectF(cx - 390, cy - 34 + dy, 780, 24), Qt.AlignmentFlag.AlignCenter,
                    fm.elidedText(detail, Qt.TextElideMode.ElideRight, 760))
@@ -1056,10 +1089,10 @@ class ProcessingOverlay(QWidget):
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setOpacity(a)
         now = self._clock.elapsed()
-        accent = self._lerp_color(QColor(TEAL_ACCENT), QColor(ERROR_RED), self._fail_color_t)
+        accent = self._lerp_color(_qc(TEAL_ACCENT), _qc(ERROR_RED), self._fail_color_t)
 
         # background + soft ambient glow
-        p.fillRect(event.rect(), QColor(BG_DARK))
+        p.fillRect(event.rect(), _qc(BG_DARK))
         c = self._center()
         glow = QRadialGradient(QPointF(c.x(), c.y() - 30), 380)
         g0 = QColor(accent); g0.setAlpha(24); g1 = QColor(accent); g1.setAlpha(0)
@@ -1076,13 +1109,13 @@ class ProcessingOverlay(QWidget):
         host = QFontMetrics(cf).elidedText(self._host, Qt.TextElideMode.ElideRight, 320)
         tw = QFontMetrics(cf).horizontalAdvance(host)
         chip = QRectF(cx - (tw + 46) / 2, cy - 138, tw + 46, 28)
-        p.setPen(QPen(QColor("#2C2C2C"), 1)); p.setBrush(QColor(255, 255, 255, 7))
+        p.setPen(QPen(_qc("#2C2C2C"), 1)); p.setBrush(_tint_overlay(7, 6))
         p.drawRoundedRect(chip, 14, 14)
         pulse = 0.5 + 0.5 * math.sin(now / 260.0)
         dot = QColor(accent); dot.setAlpha(int(110 + 145 * pulse))
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(dot)
         p.drawEllipse(QPointF(chip.left() + 16, chip.center().y()), 3, 3)
-        p.setFont(cf); p.setPen(QColor(TEXT_MUTED))
+        p.setFont(cf); p.setPen(_qc(TEXT_MUTED))
         p.drawText(QRectF(chip.left() + 27, chip.top(), tw + 12, chip.height()),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, host)
 
@@ -1100,11 +1133,11 @@ class ProcessingOverlay(QWidget):
         x0 = cx - spacing * (n - 1) / 2
         for i in range(n - 1):
             xa, xb = x0 + i * spacing + r + 7, x0 + (i + 1) * spacing - r - 7
-            p.setPen(QPen(QColor("#2A2A2A"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setPen(QPen(_qc("#2A2A2A"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawLine(QPointF(xa, ty), QPointF(xb, ty))
             if self._done_at[i] is not None:
                 fp = self._ease.valueForProgress(max(0.0, min(1.0, (now - self._done_at[i]) / 320.0)))
-                p.setPen(QPen(QColor(TEAL_ACCENT), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setPen(QPen(_qc(TEAL_ACCENT), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.drawLine(QPointF(xa, ty), QPointF(xa + (xb - xa) * fp, ty))
         lf = self._font(11, None, 0.6)
         for i in range(n):
@@ -1112,35 +1145,35 @@ class ProcessingOverlay(QWidget):
             done = self._done_at[i] is not None
             is_active = (i == self._active) and not done
             if self._failed and i == self._active:
-                p.setPen(QPen(QColor(ERROR_RED), 2)); p.setBrush(QColor(ERROR_RED))
+                p.setPen(QPen(_qc(ERROR_RED), 2)); p.setBrush(_qc(ERROR_RED))
                 p.drawEllipse(QPointF(x, ty), r, r)
-                p.setPen(QPen(QColor("#0B0B0B"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setPen(QPen(_qc("#0B0B0B"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.drawLine(QPointF(x - 3, ty - 3), QPointF(x + 3, ty + 3)); p.drawLine(QPointF(x + 3, ty - 3), QPointF(x - 3, ty + 3))
-                lab = QColor(ERROR_RED)
+                lab = _qc(ERROR_RED)
             elif done:
                 e = self._ease.valueForProgress(max(0.0, min(1.0, (now - self._done_at[i]) / 280.0)))
-                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(TEAL_ACCENT))
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(_qc(TEAL_ACCENT))
                 p.drawEllipse(QPointF(x, ty), r * (0.55 + 0.45 * e), r * (0.55 + 0.45 * e))
-                ck = QColor("#0B0B0B"); ck.setAlphaF(e)
+                ck = _qc("#0B0B0B"); ck.setAlphaF(e)
                 p.setPen(QPen(ck, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)); p.setBrush(Qt.BrushStyle.NoBrush)
                 path = QPainterPath(); path.moveTo(x - 3.6, ty + 0.4); path.lineTo(x - 1.0, ty + 3.0); path.lineTo(x + 3.8, ty - 2.8)
                 p.drawPath(path)
-                lab = QColor("#9A9A9A")
+                lab = _qc("#9A9A9A")
             elif is_active:
                 ph = (now % 1300) / 1300.0
-                halo = QColor(TEAL_ACCENT); halo.setAlpha(int(95 * (1 - ph)))
+                halo = _qc(TEAL_ACCENT); halo.setAlpha(int(95 * (1 - ph)))
                 p.setPen(Qt.PenStyle.NoPen); p.setBrush(halo)
                 p.drawEllipse(QPointF(x, ty), r + 2 + 9 * ph, r + 2 + 9 * ph)
-                p.setPen(QPen(QColor(TEAL_ACCENT), 2)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(_qc(TEAL_ACCENT), 2)); p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QPointF(x, ty), r, r)
                 br = 3.2 + 0.8 * math.sin(now / 200.0)
-                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(TEAL_ACCENT))
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(_qc(TEAL_ACCENT))
                 p.drawEllipse(QPointF(x, ty), br, br)
-                lab = QColor(TEXT_MAIN)
+                lab = _qc(TEXT_MAIN)
             else:
-                p.setPen(QPen(QColor("#3A3A3A"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(_qc("#3A3A3A"), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QPointF(x, ty), r - 1, r - 1)
-                lab = QColor("#555555")
+                lab = _qc("#555555")
             p.setFont(lf); p.setPen(lab)
             p.drawText(QRectF(x - 50, ty + r + 10, 100, 16), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self.STEPS[i][2])
 
@@ -1256,6 +1289,28 @@ class TrimLoadTab(QWidget):
         else:
             self.loading_overlay.stop()
 
+    def _download_dir(self):
+        """Where trims are saved: the folder chosen in Settings > Downloads
+        (shared with Home downloads), falling back to ./downloads."""
+        default = str(Path(__file__).resolve().parent / "downloads")
+        settings = getattr(self.main_win, "settings", None)
+        if isinstance(settings, dict):
+            return settings.get("download_dir") or default
+        return default
+
+    def apply_theme(self):
+        """Called by the main window after a live theme switch (stylesheets are
+        re-applied app-wide there; this refreshes what is not a stylesheet)."""
+        try:
+            icon_dir = Path(__file__).resolve().parent / "icons"
+            self.icon_play = theme.icon("play", icon_dir, cache_dir)
+            self.icon_pause = theme.icon("pause", icon_dir, cache_dir)
+            playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            self.btn_play.setIcon(self.icon_pause if playing else self.icon_play)
+        except Exception:
+            pass
+        self.update()
+
     def _show_toast_error(self, msg):
         self._show_toast(msg)
 
@@ -1269,16 +1324,16 @@ class TrimLoadTab(QWidget):
 
     def _mark_inputs_invalid(self):
         err_style = f"background-color: #2A1515; color: {TEXT_MAIN}; border: 1.5px solid {ERROR_RED}; border-radius: 4px; padding: 0 8px; font-size: 13px;"
-        self.start_input.setStyleSheet(err_style)
-        self.end_input.setStyleSheet(err_style)
+        _ss(self.start_input, err_style)
+        _ss(self.end_input, err_style)
         jiggle_widget(self.start_input)
         jiggle_widget(self.end_input)
         jiggle_widget(self.btn_download)
 
     def _reset_inputs_style(self):
         norm_style = f"background-color: {INPUT_BG}; color: {TEXT_MAIN}; border: none; border-radius: 4px; padding: 0 8px; font-size: 13px;"
-        self.start_input.setStyleSheet(norm_style)
-        self.end_input.setStyleSheet(norm_style)
+        _ss(self.start_input, norm_style)
+        _ss(self.end_input, norm_style)
 
     def _open_site_url(self):
         url = self.current_info.get('_url')
@@ -1288,14 +1343,14 @@ class TrimLoadTab(QWidget):
     def _build_ui(self):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        self.setStyleSheet(f"background-color: {BG_DARK};")
+        _ss(self, f"background-color: {BG_DARK};")
 
         self.search_container = QWidget()
         sc_layout = QVBoxLayout(self.search_container)
         sc_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.title_lbl = QLabel("TRIMLOAD")
-        self.title_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 68px; font-weight: 300;")
+        _ss(self.title_lbl, f"color: {TEXT_MAIN}; font-size: 68px; font-weight: 300;")
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sc_layout.addWidget(self.title_lbl)
         sc_layout.addSpacing(20)
@@ -1303,7 +1358,7 @@ class TrimLoadTab(QWidget):
         self.url_entry = QLineEdit()
         self.url_entry.setPlaceholderText("Enter link to trim...")
         self.url_entry.setFixedSize(600, 54)
-        self.url_entry.setStyleSheet(f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_MAIN}; border-radius: 27px; padding: 0 20px; font-size: 18px; border: none; }}")
+        _ss(self.url_entry, f"QLineEdit {{ background-color: {INPUT_BG}; color: {TEXT_MAIN}; border-radius: 27px; padding: 0 20px; font-size: 18px; border: none; }}")
         self.url_entry.returnPressed.connect(self._process_link)
         sc_layout.addWidget(self.url_entry, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -1319,7 +1374,7 @@ class TrimLoadTab(QWidget):
         ed_layout.setSpacing(10)
 
         self.video_frame = QFrame()
-        self.video_frame.setStyleSheet("background-color: #000000;")
+        _ss(self.video_frame, "background-color: #000000;")
         vf_layout = QVBoxLayout(self.video_frame)
         vf_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -1333,7 +1388,7 @@ class TrimLoadTab(QWidget):
         self.thumbnail_label.hide()
         
         self.preview_error_lbl = QLabel("Couldn't load preview", self.video_frame)
-        self.preview_error_lbl.setStyleSheet("color: #FFFFFF; font-size: 16px; font-weight: bold; background-color: rgba(0, 0, 0, 180); padding: 12px 24px;")
+        _ss(self.preview_error_lbl, "color: #FFFFFF; font-size: 16px; font-weight: bold; background-color: rgba(0, 0, 0, 180); padding: 12px 24px;")
         self.preview_error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_error_lbl.hide()
 
@@ -1347,7 +1402,7 @@ class TrimLoadTab(QWidget):
         meta_layout.setSpacing(4)
 
         self.meta_title_lbl = QLabel("Media Title")
-        self.meta_title_lbl.setStyleSheet("color: #FFFFFF; font-size: 20px; font-weight: bold; border: none;")
+        _ss(self.meta_title_lbl, "color: #FFFFFF; font-size: 20px; font-weight: bold; border: none;")
         self.meta_title_lbl.setWordWrap(True)
 
         sub_layout = QHBoxLayout()
@@ -1355,24 +1410,24 @@ class TrimLoadTab(QWidget):
         sub_layout.setSpacing(8)
 
         self.meta_channel_lbl = QLabel("Channel")
-        self.meta_channel_lbl.setStyleSheet("color: #DDDDDD; font-size: 14px; border: none;")
+        _ss(self.meta_channel_lbl, "color: #DDDDDD; font-size: 14px; border: none;")
 
         self.meta_dot1_lbl = QLabel("•")
-        self.meta_dot1_lbl.setStyleSheet("color: #8A8A8A; font-size: 14px; border: none;")
+        _ss(self.meta_dot1_lbl, "color: #8A8A8A; font-size: 14px; border: none;")
 
         self.meta_dur_lbl = QLabel("0:00 mins")
-        self.meta_dur_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 14px; border: none;")
+        _ss(self.meta_dur_lbl, f"color: {TEXT_MAIN}; font-size: 14px; border: none;")
 
         self.meta_dot2_lbl = QLabel("•")
-        self.meta_dot2_lbl.setStyleSheet("color: #8A8A8A; font-size: 14px; border: none;")
+        _ss(self.meta_dot2_lbl, "color: #8A8A8A; font-size: 14px; border: none;")
 
         self.meta_site_icon = QLabel("▶")
-        self.meta_site_icon.setStyleSheet("color: #FF0000; font-size: 14px; border: none;")
+        _ss(self.meta_site_icon, "color: #FF0000; font-size: 14px; border: none;")
         self.meta_site_icon.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.meta_site_icon.mousePressEvent = lambda event: self._open_site_url()
 
         self.meta_site_lbl = QLabel("YouTube")
-        self.meta_site_lbl.setStyleSheet("color: #FFFFFF; font-size: 14px; font-weight: bold; border: none;")
+        _ss(self.meta_site_lbl, "color: #FFFFFF; font-size: 14px; font-weight: bold; border: none;")
         self.meta_site_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.meta_site_lbl.mousePressEvent = lambda event: self._open_site_url()
 
@@ -1391,7 +1446,7 @@ class TrimLoadTab(QWidget):
 
         timeline_frame = QFrame()
         timeline_frame.setFixedHeight(54)
-        timeline_frame.setStyleSheet("background-color: #1A1A1A;")
+        _ss(timeline_frame, "background-color: #1A1A1A;")
         tl_layout = QHBoxLayout(timeline_frame)
         tl_layout.setContentsMargins(8, 0, 12, 0)
         tl_layout.setSpacing(6)
@@ -1399,18 +1454,18 @@ class TrimLoadTab(QWidget):
         self.btn_play = QPushButton()
         self.btn_play.setFixedSize(32, 32)
         self.btn_play.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_play.setStyleSheet(f"QPushButton {{ background: transparent; border: none; }}")
+        _ss(self.btn_play, f"QPushButton {{ background: transparent; border: none; }}")
         
         icon_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
-        self.icon_play = QIcon(os.path.join(icon_dir, "play.png"))
-        self.icon_pause = QIcon(os.path.join(icon_dir, "pause.png"))
+        self.icon_play = theme.icon("play", Path(icon_dir), cache_dir)
+        self.icon_pause = theme.icon("pause", Path(icon_dir), cache_dir)
         
         self.btn_play.setIcon(self.icon_play)
         self.btn_play.clicked.connect(self._toggle_play)
         tl_layout.addWidget(self.btn_play)
 
         self.time_lbl = QLabel("00:00:00 / 00:00:00")
-        self.time_lbl.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 13px; font-family: monospace; border: none;")
+        _ss(self.time_lbl, f"color: {TEXT_MAIN}; font-size: 13px; font-family: '{_mono_family()}'; border: none;")
         tl_layout.addWidget(self.time_lbl)
 
         self.range_slider = TrimRangeSlider()
@@ -1423,7 +1478,7 @@ class TrimLoadTab(QWidget):
 
         dock_frame = QFrame()
         dock_frame.setFixedHeight(96) # Raised from 76 to fit two clean rows
-        dock_frame.setStyleSheet("QFrame { background-color: #1A1A1A; }")
+        _ss(dock_frame, "QFrame { background-color: #1A1A1A; }")
         
         grid = QGridLayout(dock_frame)
         grid.setContentsMargins(16, 12, 16, 12)
@@ -1432,11 +1487,11 @@ class TrimLoadTab(QWidget):
 
         # --- ROW 0 & 1: TIME CONTROLS (Left Side) ---
         lbl_start = QLabel("Start")
-        lbl_start.setStyleSheet("color: #FFFFFF; font-size: 13px;")
+        _ss(lbl_start, "color: #FFFFFF; font-size: 13px;")
         grid.addWidget(lbl_start, 0, 0)
 
         lbl_end = QLabel("End")
-        lbl_end.setStyleSheet("color: #FFFFFF; font-size: 13px;")
+        _ss(lbl_end, "color: #FFFFFF; font-size: 13px;")
         grid.addWidget(lbl_end, 0, 1)
 
         self.start_input = QLineEdit("00:00:00")
@@ -1454,7 +1509,7 @@ class TrimLoadTab(QWidget):
         # --- ROW 0: SETTINGS CONTROLS (Shifted Higher) ---
         mode_frame = QFrame()
         mode_frame.setFixedSize(130, 28)
-        mode_frame.setStyleSheet("QFrame { background-color: #252525; border: 1px solid #333333; border-radius: 6px; }")
+        _ss(mode_frame, "QFrame { background-color: #252525; border: 1px solid #333333; border-radius: 6px; }")
         m_layout = QHBoxLayout(mode_frame)
         m_layout.setContentsMargins(2, 2, 2, 2)
         m_layout.setSpacing(0)
@@ -1475,7 +1530,7 @@ class TrimLoadTab(QWidget):
 
         self.qual_combo = AnimatedComboBox()
         self.qual_combo.setFixedSize(90, 28)
-        self.qual_combo.setStyleSheet("""
+        _ss(self.qual_combo, """
             QComboBox { 
                 background-color: #1A1A1A; 
                 color: #FFFFFF; 
@@ -1500,7 +1555,7 @@ class TrimLoadTab(QWidget):
         grid.addWidget(self.qual_combo, 0, 4)
 
         self.est_size_lbl = QLabel("Est. size ~0 MB")
-        self.est_size_lbl.setStyleSheet("color: #EEEEEE; font-size: 13px;")
+        _ss(self.est_size_lbl, "color: #EEEEEE; font-size: 13px;")
         
         # MOVED TO ROW 0
         grid.addWidget(self.est_size_lbl, 0, 5)
@@ -1515,14 +1570,14 @@ class TrimLoadTab(QWidget):
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setFixedSize(90, 32)
         self.btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_cancel.setStyleSheet(f"QPushButton {{ background: transparent; border: 1px solid {TEAL_ACCENT}; color: #FFFFFF; border-radius: 16px; font-size: 14px; font-weight: 400; }} QPushButton:hover {{ background: #222; }}")
+        _ss(self.btn_cancel, f"QPushButton {{ background: transparent; border: 1px solid {TEAL_ACCENT}; color: #FFFFFF; border-radius: 16px; font-size: 14px; font-weight: 400; }} QPushButton:hover {{ background: #222; }}")
         self.btn_cancel.clicked.connect(self._show_initial_view)
         btn_layout.addWidget(self.btn_cancel)
 
         self.btn_download = QPushButton("Download")
         self.btn_download.setFixedSize(100, 32)
         self.btn_download.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_download.setStyleSheet(f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #000000; border-radius: 16px; font-size: 14px; border: none; font-weight: 500; }} QPushButton:hover {{ background-color: #00A892; }}")
+        _ss(self.btn_download, f"QPushButton {{ background-color: {TEAL_ACCENT}; color: #000000; border-radius: 16px; font-size: 14px; border: none; font-weight: 500; }} QPushButton:hover {{ background-color: #00A892; }}")
         self.btn_download.clicked.connect(self._on_download)
         btn_layout.addWidget(self.btn_download)
 
@@ -1730,14 +1785,14 @@ class TrimLoadTab(QWidget):
             self.meta_site_icon.clear()
             pix = QPixmap(fav_path).scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.meta_site_icon.setPixmap(pix)
-            self.meta_site_icon.setStyleSheet("border: none; background: transparent;")
+            _ss(self.meta_site_icon, "border: none; background: transparent;")
         else:
             if "Youtube" in site or "YouTube" in site:
                 self.meta_site_icon.setText("▶")
-                self.meta_site_icon.setStyleSheet("color: #FF0000; font-size: 14px; border: none;")
+                _ss(self.meta_site_icon, "color: #FF0000; font-size: 14px; border: none;")
             else:
                 self.meta_site_icon.setText("🌐")
-                self.meta_site_icon.setStyleSheet(f"color: {TEAL_ACCENT}; font-size: 14px; border: none;")
+                _ss(self.meta_site_icon, f"color: {TEAL_ACCENT}; font-size: 14px; border: none;")
 
         if '_thumb_data' in info:
             pixmap = QPixmap()
@@ -1789,7 +1844,7 @@ class TrimLoadTab(QWidget):
             self._on_player_error(QMediaPlayer.Error.ResourceError, "No stream url available")
 
         dur_s = round(self.proc_overlay._clock.elapsed() / 1000.0)
-        color = ERROR_RED if dur_s >= 60 else TEXT_MAIN
+        color = theme.map_hex(ERROR_RED if dur_s >= 60 else TEXT_MAIN, "text")
         check_pix = QIcon(str(repo_root / "icons" / "check.png")).pixmap(22, 22)
         self._show_toast(
             f'Finished in <span style="color: {color};">{dur_s}s</span>',
@@ -1803,8 +1858,8 @@ class TrimLoadTab(QWidget):
         inact = f"QPushButton {{ background-color: transparent; color: {TEXT_MUTED}; font-size: 13px; font-weight: 500; border-radius: 4px; border: none; }}"
         
         if is_audio:
-            self.btn_mode_aud.setStyleSheet(act)
-            self.btn_mode_vid.setStyleSheet(inact)
+            _ss(self.btn_mode_aud, act)
+            _ss(self.btn_mode_vid, inact)
             self.video_widget.hide()
             self.thumbnail_label.show()
             
@@ -1814,8 +1869,8 @@ class TrimLoadTab(QWidget):
             else:
                 self.preview_error_lbl.hide()
         else:
-            self.btn_mode_vid.setStyleSheet(act)
-            self.btn_mode_aud.setStyleSheet(inact)
+            _ss(self.btn_mode_vid, act)
+            _ss(self.btn_mode_aud, inact)
             
             if self.preview_failed:
                 self.video_widget.hide()
@@ -2007,7 +2062,7 @@ class TrimLoadTab(QWidget):
             title=f"[Trimmed] {title}",
             channel=self.current_info.get('uploader') or self.current_info.get('channel', 'YouTube'),
             thumb_path=thumb_path,
-            out_dir=str(Path(__file__).resolve().parent / "downloads"),
+            out_dir=self._download_dir(),
             is_audio=self.is_audio_mode,
             selected_fid=selected_fid,
             duration_str=format_time_str(e - s),
@@ -2038,8 +2093,8 @@ if __name__ == "__main__":
     app.installEventFilter(ctx_menu_blocker)
 
     palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(TEAL_ACCENT))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, _qc(TEAL_ACCENT))
+    palette.setColor(QPalette.ColorRole.HighlightedText, _qc("#000000"))
     app.setPalette(palette)
 
     window = TrimLoadTab()
